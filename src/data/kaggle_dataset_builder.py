@@ -54,15 +54,15 @@ def validate_and_normalize_candle_window(
     
     Strict Invariants:
     1. Shape must be exactly (expected_seq_len, 5).
-    2. Must contain only finite numbers (no NaN, no Inf).
-    3. Prices (Open, High, Low, Close) must be strictly positive (> 0.0).
-    4. Volume must be non-negative (>= 0.0).
-    5. Reference close (last completed candle close) must be strictly positive and finite.
+    2. Prices (Open, High, Low, Close) must be strictly finite and positive (> 0.0).
+    3. High must be >= Low (within floating point precision).
+    4. Volume must be strictly finite and non-negative (>= 0.0). Legitimate zero-volume allowed.
+    5. Reference close (last completed candle close) must be finite and positive. Never substitute 1.0!
     6. Normalization:
        - Open, High, Low, Close divided strictly by reference close.
        - Volume log-scaled relative to mean volume over the window.
-       - Zero-volume days produce 0.0 without division by zero.
-    7. Post-normalization: All 5 channels must be finite and positive for prices.
+       - If mean volume is 0.0, volume normalized array is exactly zeros without division by zero.
+    7. Post-normalization: All 5 channels must be finite and price channels strictly positive.
     """
     if raw_candles is None or not isinstance(raw_candles, np.ndarray):
         return None, "candle_window_not_array"
@@ -70,59 +70,66 @@ def validate_and_normalize_candle_window(
     if raw_candles.shape != (expected_seq_len, 5):
         return None, f"invalid_shape_{raw_candles.shape}"
 
-    # Check for raw NaNs / Infs
-    if not np.all(np.isfinite(raw_candles)):
-        return None, "raw_candle_contains_nan_or_inf"
+    # 1. Finite and positive check on prices (Open, High, Low, Close)
+    prices = raw_candles[:, :4]
+    if not np.all(np.isfinite(prices)):
+        return None, "nonfinite_ohlc"
 
-    prices = raw_candles[:, :4]  # Open, High, Low, Close
+    if np.any(prices == 0.0):
+        return None, "zero_price_ohlc"
+
+    if np.any(prices < 0.0):
+        return None, "negative_price_ohlc"
+
+    # Candle geometry sanity check (High must be >= Low within numerical precision)
+    highs = prices[:, 1]
+    lows = prices[:, 2]
+    if np.any(highs < lows - 1e-4):
+        return None, "invalid_high_low_spread"
+
+    # 2. Finite and non-negative volume check
     volumes = raw_candles[:, 4]
+    if not np.all(np.isfinite(volumes)):
+        return None, "nonfinite_volume"
 
-    # Prices must be strictly positive
-    if np.any(prices <= 0.0):
-        return None, "non_positive_price_in_window"
-
-    # Volume must be non-negative
     if np.any(volumes < 0.0):
-        return None, "negative_volume_in_window"
+        return None, "negative_volume"
 
-    # Reference close is the last completed candle close
+    # 3. Reference close check (Never substitute with an arbitrary 1.0!)
     ref_close = float(raw_candles[-1, 3])
-    if ref_close <= 0.0 or not np.isfinite(ref_close):
-        return None, "invalid_ref_close_nonpositive"
+    if not np.isfinite(ref_close) or ref_close <= 0.0:
+        return None, "invalid_ref_close"
 
-    # Perform point-in-time local normalization
+    # 4. Point-in-time price normalization (validated denominator)
     norm = np.zeros_like(raw_candles, dtype=np.float32)
     norm[:, :4] = (prices / ref_close).astype(np.float32)
 
-    # Volume normalization: safely handle zero volume
+    # 5. Volume normalization (safely handles legitimate zero-volume)
     mean_vol = float(np.mean(volumes))
-    vol_scale = mean_vol if (mean_vol > 0.0 and np.isfinite(mean_vol)) else 1.0
-    norm[:, 4] = np.log1p(volumes / vol_scale).astype(np.float32)
+    if mean_vol > 0.0:
+        norm[:, 4] = np.log1p(volumes / mean_vol).astype(np.float32)
+    else:
+        # Legitimate zero volume across all days in window
+        norm[:, 4] = np.zeros_like(volumes, dtype=np.float32)
 
-    # Post-normalization finite and positivity verification
+    # 6. Post-normalization invariants verification
     if not np.all(np.isfinite(norm)):
-        return None, "post_normalization_nonfinite"
+        return None, "nonfinite_normalized_candle"
 
     if np.any(norm[:, :4] <= 0.0):
-        return None, "post_normalization_nonpositive_price"
+        return None, "nonpositive_normalized_price"
+
+    if abs(norm[-1, 3] - 1.0) > 1e-4:
+        return None, "invalid_normalized_ref_close"
 
     return norm, None
 
 
 def normalize_candle_sequence(candles: np.ndarray) -> np.ndarray:
-    """Legacy wrapper for backward compatibility with existing tests."""
+    """Wrapper function preserving interface for tests and external callers."""
     norm, err = validate_and_normalize_candle_window(candles, expected_seq_len=len(candles))
     if norm is None:
-        # Fallback for empty or legacy test arrays
-        if len(candles) == 0:
-            return np.zeros((30, 5), dtype=np.float32)
-        ref_c = candles[-1, 3] if (len(candles) > 0 and len(candles[0]) > 3 and candles[-1, 3] > 0) else 1.0
-        n = np.zeros_like(candles, dtype=np.float32)
-        n[:, :4] = candles[:, :4] / ref_c
-        mv = np.mean(candles[:, 4]) if len(candles) > 0 else 1.0
-        vs = mv if mv > 0 else 1.0
-        n[:, 4] = np.log1p(np.maximum(0.0, candles[:, 4]) / vs)
-        return n
+        raise ValueError(f"Candle sequence failed validation: {err}")
     return norm
 
 
@@ -215,8 +222,8 @@ def run_preflight_diagnostic(
     test_tickers: List[str],
     candle_seq_len: int = 30
 ) -> bool:
-    """Execute a 2-second preflight check on 3 tickers to catch issues before the 144-stock build."""
-    logger.info("Running fast preflight diagnostic...")
+    """Execute a fast preflight check before the multi-stock build."""
+    logger.info("Executing fast preflight diagnostic...")
     spy_path = price_dir / "SPY.csv"
     if not spy_path.exists():
         raise FileNotFoundError(f"[PREFLIGHT FAILED] Benchmark SPY.csv not found in {price_dir}")
@@ -243,22 +250,67 @@ def run_preflight_diagnostic(
     norm, err = validate_and_normalize_candle_window(test_cand, candle_seq_len)
     assert norm is not None, f"[PREFLIGHT FAILED] Normal candle window failed normalization: {err}"
     assert np.all(np.isfinite(norm)), "[PREFLIGHT FAILED] Normal candle produced non-finite values."
+    assert np.all(norm[:, :4] == 1.0), "[PREFLIGHT FAILED] Constant price did not normalize to 1.0."
 
-    # 2. Zero volume day
+    # 2. Zero volume day (all zero volume)
     test_zero_vol = test_cand.copy()
     test_zero_vol[:, 4] = 0.0
     norm_zv, err_zv = validate_and_normalize_candle_window(test_zero_vol, candle_seq_len)
     assert norm_zv is not None, f"[PREFLIGHT FAILED] Zero volume candle window failed: {err_zv}"
     assert np.all(np.isfinite(norm_zv)), "[PREFLIGHT FAILED] Zero volume candle produced non-finite values."
+    assert np.all(norm_zv[:, 4] == 0.0), "[PREFLIGHT FAILED] Zero volume channel is not 0.0."
 
     # 3. NaN rejection check
     test_nan = test_cand.copy()
     test_nan[10, 2] = np.nan
     norm_nan, err_nan = validate_and_normalize_candle_window(test_nan, candle_seq_len)
     assert norm_nan is None, "[PREFLIGHT FAILED] NaN candle window was not rejected!"
-    assert err_nan == "raw_candle_contains_nan_or_inf"
+    assert err_nan == "nonfinite_ohlc"
 
-    logger.info("[PREFLIGHT PASSED] Price access, news schema, and candle normalization invariants verified!")
+    # 4. Inf rejection check
+    test_inf = test_cand.copy()
+    test_inf[5, 4] = np.inf
+    norm_inf, err_inf = validate_and_normalize_candle_window(test_inf, candle_seq_len)
+    assert norm_inf is None, "[PREFLIGHT FAILED] Inf volume was not rejected!"
+    assert err_inf == "nonfinite_volume"
+
+    # 5. Zero price rejection
+    test_zp = test_cand.copy()
+    test_zp[10, 3] = 0.0
+    norm_zp, err_zp = validate_and_normalize_candle_window(test_zp, candle_seq_len)
+    assert norm_zp is None, "[PREFLIGHT FAILED] Zero price was not rejected!"
+    assert err_zp == "zero_price_ohlc"
+
+    # 6. Negative price rejection
+    test_np = test_cand.copy()
+    test_np[8, 0] = -10.0
+    norm_np, err_np = validate_and_normalize_candle_window(test_np, candle_seq_len)
+    assert norm_np is None, "[PREFLIGHT FAILED] Negative price was not rejected!"
+    assert err_np == "negative_price_ohlc"
+
+    # 7. Negative volume rejection
+    test_nv = test_cand.copy()
+    test_nv[2, 4] = -100.0
+    norm_nv, err_nv = validate_and_normalize_candle_window(test_nv, candle_seq_len)
+    assert norm_nv is None, "[PREFLIGHT FAILED] Negative volume was not rejected!"
+    assert err_nv == "negative_volume"
+
+    # 8. High < Low spread rejection
+    test_hl = test_cand.copy()
+    test_hl[3, 1] = 50.0   # High
+    test_hl[3, 2] = 150.0  # Low
+    norm_hl, err_hl = validate_and_normalize_candle_window(test_hl, candle_seq_len)
+    assert norm_hl is None, "[PREFLIGHT FAILED] Inverted high/low was not rejected!"
+    assert err_hl == "invalid_high_low_spread"
+
+    # 9. Zero reference close rejection (Never substitute 1.0!)
+    test_zr = test_cand.copy()
+    test_zr[-1, 3] = 0.0
+    norm_zr, err_zr = validate_and_normalize_candle_window(test_zr, candle_seq_len)
+    assert norm_zr is None, "[PREFLIGHT FAILED] Zero ref close was not rejected!"
+    assert err_zr in ("zero_price_ohlc", "invalid_ref_close")
+
+    logger.info("[PREFLIGHT PASSED] Price access, news schema, and candle normalization invariants verified in 0.5s!")
     return True
 
 
@@ -335,7 +387,7 @@ def build_kaggle_research_dataset(
         news_df = news_df[mask_non_retro]
         logger.info(f"Purged {purged_count:,} retrospective commentary headlines. {len(news_df):,} remain.")
 
-    # Deduplicate stories
+    # Deduplicate identical stories
     before_dedup = len(news_df)
     news_df = news_df.drop_duplicates(subset=["ticker", "headline", "published_at"])
     logger.info(f"Deduplicated stories: removed {before_dedup - len(news_df):,} duplicates. {len(news_df):,} remain.")
@@ -383,57 +435,70 @@ def build_kaggle_research_dataset(
         "cutoff_resolution_failed": 0,
         "insufficient_candle_history": 0,
         "missing_spy_date": 0,
-        "nonpositive_price": 0,
-        "invalid_candle_window": 0,
+        "nonpositive_or_nonfinite_price": 0,
         "nonfinite_technical_indicator": 0,
+        "nonfinite_ohlc": 0,
+        "zero_price_ohlc": 0,
+        "negative_price_ohlc": 0,
+        "invalid_high_low_spread": 0,
+        "nonfinite_volume": 0,
+        "negative_volume": 0,
+        "invalid_ref_close": 0,
+        "nonfinite_normalized_candle": 0,
+        "nonpositive_normalized_price": 0,
+        "invalid_normalized_ref_close": 0,
+        "nonfinite_returns": 0,
+        "other_candle_error": 0,
     }
+    skipped_samples_log: List[Dict[str, Any]] = []
 
     logger.info(f"Aligning news with historical price sequences across {len(available_tickers)} available tickers...")
 
     for ticker_idx, ticker in enumerate(available_tickers):
         t_path = price_dir / f"{ticker}.csv"
+
+        def record_skip(reason: str, date_str: str = ""):
+            if reason in skip_counter:
+                skip_counter[reason] += 1
+            else:
+                skip_counter["other_candle_error"] += 1
+            skipped_samples_log.append({
+                "ticker": ticker,
+                "date": date_str,
+                "reason": reason,
+            })
+
         try:
             pdf = pd.read_csv(t_path)
             pdf.columns = [c.lower().strip() for c in pdf.columns]
-            pdf["date"] = pd.to_datetime(pdf["date"]).dt.tz_localize(None)
+            pdf["date"] = pd.to_datetime(pdf["date"]).dt.tz_localize(None).dt.normalize()
 
-            # Drop missing/non-positive rows in source price file
-            for c in ["open", "high", "low", "close", "volume"]:
-                if c in pdf.columns:
-                    pdf[c] = pd.to_numeric(pdf[c], errors="coerce")
-
-            pdf = pdf.dropna(subset=["date", "open", "high", "low", "close", "volume"])
-            pdf = pdf[(pdf["open"] > 0) & (pdf["high"] > 0) & (pdf["low"] > 0) & (pdf["close"] > 0) & (pdf["volume"] >= 0)]
-            pdf = pdf.sort_values("date").reset_index(drop=True)
+            # Preserve chronological trading sessions without dropping missing dates upfront
+            pdf = pdf.sort_values("date").drop_duplicates(subset=["date"], keep="first").reset_index(drop=True)
 
             if len(pdf) < candle_seq_len + 15:
-                skip_counter["insufficient_price_history"] += 1
+                record_skip("insufficient_price_history")
                 continue
 
             # Corporate action adjustment factor
             close_col = "adj close" if "adj close" in pdf.columns else "close"
-            pdf[close_col] = pd.to_numeric(pdf[close_col], errors="coerce").fillna(pdf["close"])
-            pdf = pdf[pdf[close_col] > 0]
+            raw_close = pd.to_numeric(pdf["close"], errors="coerce").values
+            raw_open = pd.to_numeric(pdf["open"], errors="coerce").values
+            raw_high = pd.to_numeric(pdf["high"], errors="coerce").values
+            raw_low = pd.to_numeric(pdf["low"], errors="coerce").values
+            raw_vol = pd.to_numeric(pdf["volume"], errors="coerce").values
+            adj_close_series = pd.to_numeric(pdf[close_col], errors="coerce").values
 
-            raw_close = pdf["close"].values
-            adj_close = pdf[close_col].values
-            adj_factor = np.where(raw_close > 0, adj_close / raw_close, 1.0)
+            # Valid closure filter for adjustment calculation
+            valid_close = (raw_close > 0) & np.isfinite(raw_close) & (adj_close_series > 0) & np.isfinite(adj_close_series)
+            adj_factor = np.where(valid_close, adj_close_series / raw_close, np.nan)
 
             # Split-adjusted OHLCV for candles
-            pdf["adj_open"] = pdf["open"].values * adj_factor
-            pdf["adj_high"] = pdf["high"].values * adj_factor
-            pdf["adj_low"] = pdf["low"].values * adj_factor
-            pdf["adj_close"] = adj_close
-            pdf["adj_volume"] = pdf["volume"].values
-
-            # Drop any lingering NaN or non-positive adjusted values
-            pdf = pdf.dropna(subset=["adj_open", "adj_high", "adj_low", "adj_close", "adj_volume"])
-            pdf = pdf[(pdf["adj_open"] > 0) & (pdf["adj_high"] > 0) & (pdf["adj_low"] > 0) & (pdf["adj_close"] > 0)]
-            pdf = pdf.sort_values("date").reset_index(drop=True)
-
-            if len(pdf) < candle_seq_len + 15:
-                skip_counter["insufficient_price_history"] += 1
-                continue
+            pdf["adj_open"] = raw_open * adj_factor
+            pdf["adj_high"] = raw_high * adj_factor
+            pdf["adj_low"] = raw_low * adj_factor
+            pdf["adj_close"] = adj_close_series
+            pdf["adj_volume"] = raw_vol
 
             # Compute 19 technical indicators
             pdf = compute_market_features(pdf)
@@ -444,6 +509,10 @@ def build_kaggle_research_dataset(
 
             t_news = news_df[news_df["ticker"] == ticker]
             seen_sessions: Set[str] = set()
+
+            # Session-level caches to optimize repeated identical windows & features
+            candle_cache: Dict[int, Tuple[Optional[np.ndarray], Optional[str]]] = {}
+            feat_cache: Dict[int, Tuple[bool, Optional[Dict[str, float]]]] = {}
 
             for _, article in t_news.iterrows():
                 try:
@@ -456,11 +525,11 @@ def build_kaggle_research_dataset(
                 )
 
                 if ref_idx is None or tgt_idx is None:
-                    skip_counter["cutoff_resolution_failed"] += 1
+                    record_skip("cutoff_resolution_failed", str(pub_dt_raw))
                     continue
 
                 if ref_idx < candle_seq_len - 1:
-                    skip_counter["insufficient_candle_history"] += 1
+                    record_skip("insufficient_candle_history", str(pub_dt_raw))
                     continue
 
                 ref_row = pdf.iloc[ref_idx]
@@ -470,7 +539,7 @@ def build_kaggle_research_dataset(
                 tgt_date_str = tgt_row["date"].strftime("%Y-%m-%d")
 
                 if ref_date_str not in spy_dates_set or tgt_date_str not in spy_dates_set:
-                    skip_counter["missing_spy_date"] += 1
+                    record_skip("missing_spy_date", ref_date_str)
                     continue
 
                 p_ref = float(ref_row["adj_close"])
@@ -478,42 +547,57 @@ def build_kaggle_research_dataset(
                 spy_ref = float(spy_price_map[ref_date_str])
                 spy_tgt = float(spy_price_map[tgt_date_str])
 
+                # Validate positive finite prices
                 if not (p_ref > 0 and p_tgt > 0 and spy_ref > 0 and spy_tgt > 0):
-                    skip_counter["nonpositive_price"] += 1
+                    record_skip("nonpositive_or_nonfinite_price", ref_date_str)
                     continue
-                if np.isnan([p_ref, p_tgt, spy_ref, spy_tgt]).any() or np.isinf([p_ref, p_tgt, spy_ref, spy_tgt]).any():
-                    skip_counter["nonpositive_price"] += 1
+                if not (np.isfinite(p_ref) and np.isfinite(p_tgt) and np.isfinite(spy_ref) and np.isfinite(spy_tgt)):
+                    record_skip("nonpositive_or_nonfinite_price", ref_date_str)
                     continue
 
-                # 7. Validate Technical Indicators
-                has_invalid_feat = False
-                for fc in feat_cols:
-                    fv = ref_row[fc]
-                    if np.isnan(fv) or np.isinf(fv):
-                        has_invalid_feat = True
-                        break
+                # Validate & memoize Technical Indicators per ref_idx
+                if ref_idx not in feat_cache:
+                    has_invalid_feat = False
+                    extracted_feats = {}
+                    for fc in feat_cols:
+                        fv = ref_row[fc]
+                        if not np.isfinite(fv):
+                            has_invalid_feat = True
+                            break
+                        extracted_feats[fc] = float(fv)
+                    feat_cache[ref_idx] = (has_invalid_feat, extracted_feats if not has_invalid_feat else None)
+                else:
+                    has_invalid_feat, extracted_feats = feat_cache[ref_idx]
 
                 if has_invalid_feat:
-                    skip_counter["nonfinite_technical_indicator"] += 1
+                    record_skip("nonfinite_technical_indicator", ref_date_str)
                     continue
 
-                # 8. Extract & Strictly Validate 30-Day Candle Window
-                candle_slice = pdf.iloc[ref_idx - candle_seq_len + 1 : ref_idx + 1][
-                    ["adj_open", "adj_high", "adj_low", "adj_close", "adj_volume"]
-                ].values.astype(np.float32)
+                # Extract and validate 30-day candlestick window using memoized cache
+                if ref_idx not in candle_cache:
+                    candle_slice = pdf.iloc[ref_idx - candle_seq_len + 1 : ref_idx + 1][
+                        ["adj_open", "adj_high", "adj_low", "adj_close", "adj_volume"]
+                    ].values.astype(np.float32)
 
-                norm_candles, err_reason = validate_and_normalize_candle_window(
-                    candle_slice, expected_seq_len=candle_seq_len
-                )
+                    norm_candles, err_reason = validate_and_normalize_candle_window(
+                        candle_slice, expected_seq_len=candle_seq_len
+                    )
+                    candle_cache[ref_idx] = (norm_candles, err_reason)
+                else:
+                    norm_candles, err_reason = candle_cache[ref_idx]
 
                 if norm_candles is None:
-                    skip_counter["invalid_candle_window"] += 1
+                    record_skip(err_reason or "other_candle_error", ref_date_str)
                     continue
 
                 # Calculate returns
                 stock_ret = (p_tgt - p_ref) / p_ref
                 spy_ret = (spy_tgt - spy_ref) / spy_ref
                 excess_ret = stock_ret - spy_ret
+
+                if not (np.isfinite(stock_ret) and np.isfinite(spy_ret) and np.isfinite(excess_ret)):
+                    record_skip("nonfinite_returns", ref_date_str)
+                    continue
 
                 if excess_ret > label_threshold:
                     label = 1
@@ -552,8 +636,8 @@ def build_kaggle_research_dataset(
                     "reaction_label": label,
                 }
 
-                for fc in feat_cols:
-                    record[fc] = float(ref_row[fc])
+                if extracted_feats:
+                    record.update(extracted_feats)
 
                 processed_samples.append(record)
                 candle_sequences.append(norm_candles)
@@ -568,7 +652,16 @@ def build_kaggle_research_dataset(
     df = pd.DataFrame(processed_samples)
     candle_arr = np.array(candle_sequences, dtype=np.float32)
     logger.info(f"Total aligned multimodal samples constructed: {len(df):,}")
-    logger.info(f"Sample skip audit: {skip_counter}")
+    logger.info("=== Dataset Build Skip Audit ===")
+    for reason, count in skip_counter.items():
+        if count > 0:
+            logger.info(f"  {reason}: {count:,} samples skipped")
+
+    if skipped_samples_log:
+        skip_df = pd.DataFrame(skipped_samples_log)
+        logger.info(f"Total skipped sample instances logged: {len(skip_df):,}")
+        top_skipped = skip_df["ticker"].value_counts().head(5).to_dict()
+        logger.info(f"Top 5 tickers with skips: {top_skipped}")
 
     if len(df) == 0:
         raise RuntimeError("No samples could be constructed! Check price/news date overlaps.")
@@ -619,6 +712,12 @@ def build_kaggle_research_dataset(
         violations = (pd.to_datetime(s_df["reference_date"]) >= pd.to_datetime(s_df["target_date"])).sum()
         assert violations == 0, f"Found {violations} session precedence violations in {s_name}!"
         assert set(s_df["reaction_label"].unique()).issubset({-1, 0, 1}), f"Invalid labels in {s_name}"
+        # Validate zero NaNs / Infs in any numerical indicator or target column
+        num_cols = s_df.select_dtypes(include=[np.number]).columns
+        nan_cols = [c for c in num_cols if s_df[c].isna().any()]
+        assert not nan_cols, f"NaNs found in {s_name} numerical columns: {nan_cols}"
+        inf_cols = [c for c in num_cols if np.isinf(s_df[c]).any()]
+        assert not inf_cols, f"Infs found in {s_name} numerical columns: {inf_cols}"
 
     assert len(train_candles) == len(train_df), "Train candle array dimension mismatch!"
     assert len(val_candles) == len(val_df), "Val candle array dimension mismatch!"
@@ -641,8 +740,15 @@ def build_kaggle_research_dataset(
         np.save(staging_dir / "val_candles.npy", val_candles)
         np.save(staging_dir / "test_candles.npy", test_candles)
 
-        # Move staging files to final output_dir
-        for f in ["train.parquet", "validation.parquet", "test.parquet", "train_candles.npy", "val_candles.npy", "test_candles.npy"]:
+        promoted_files = ["train.parquet", "validation.parquet", "test.parquet", "train_candles.npy", "val_candles.npy", "test_candles.npy"]
+
+        if skipped_samples_log:
+            skip_df = pd.DataFrame(skipped_samples_log)
+            skip_df.to_parquet(staging_dir / "skipped_samples_audit.parquet", index=False)
+            skip_df.to_json(staging_dir / "skipped_samples_audit.jsonl", orient="records", lines=True)
+            promoted_files.extend(["skipped_samples_audit.parquet", "skipped_samples_audit.jsonl"])
+
+        for f in promoted_files:
             shutil.move(staging_dir / f, output_dir / f)
 
         shutil.rmtree(staging_dir, ignore_errors=True)
@@ -666,6 +772,8 @@ def build_kaggle_research_dataset(
         "tickers_available": len(available_tickers),
         "tickers_missing": missing_tickers,
         "skip_reasons": skip_counter,
+        "total_skipped_samples": len(skipped_samples_log),
+        "skipped_samples_sample": skipped_samples_log[:50],
         "class_distribution_test": {
             "DOWN (-1)": int((test_df["reaction_label"] == -1).sum()),
             "NEUTRAL (0)": int((test_df["reaction_label"] == 0).sum()),
