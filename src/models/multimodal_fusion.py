@@ -24,16 +24,49 @@ logger = logging.getLogger(__name__)
 FINBERT_NAME = "ProsusAI/finbert"
 
 
+from src.models.multimodal_kaggle import UnifiedReactionModel
+
+class MultimodalFusionModel(UnifiedReactionModel):
+    """Production 3-Modality Late Fusion Network: FinBERT + Candlestick CNN + Tabular Indicators.
+    
+    Consumes three distinct inputs:
+    1. input_ids, attention_mask: FinBERT-tokenized financial news headlines
+    2. candles: (Batch, 30, 5) normalized sequential OHLCV candlestick sequences
+    3. indicators: (Batch, num_features) documented backward-looking technical features (default 16)
+    """
+
+    def __init__(
+        self,
+        pretrained_bert: str = FINBERT_NAME,
+        pretrained_model: Optional[str] = None,
+        num_features: int = 16,
+        num_indicators: Optional[int] = None,
+        num_classes: int = 3,
+        freeze_layers: int = 10,
+        mode: str = "partial_finetune_fusion",
+        **kwargs
+    ):
+        model_name = pretrained_model or pretrained_bert
+        ind_dim = num_indicators if num_indicators is not None else num_features
+        super().__init__(
+            mode=mode,
+            pretrained_bert=model_name,
+            num_indicators=ind_dim,
+            num_classes=num_classes,
+            **kwargs
+        )
+
+
 class MultimodalFusionNet(nn.Module):
     """
     Multimodal fusion architecture combining frozen FinBERT embeddings (768-dim)
-    and numerical candlestick features (19-dim).
+    and numerical candlestick features (16-dim).
     """
 
     def __init__(
         self,
         text_dim: int = 768,
-        price_dim: int = 19,
+        price_dim: int = 16,
         price_hidden: int = 64,
         fusion_hidden: int = 128,
         num_classes: int = 3,

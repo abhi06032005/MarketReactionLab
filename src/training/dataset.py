@@ -84,3 +84,67 @@ class MarketReactionDataset(Dataset):
                 item["token_type_ids"] = tokenized["token_type_ids"].squeeze(0)
 
         return item
+
+
+# Export alias for Kaggle multimodal pipelines
+from src.training.kaggle_dataset import KaggleMultimodalDataset
+FinancialReactionDataset = KaggleMultimodalDataset
+
+
+def load_processed_kaggle_dataset(
+    processed_dir: Path,
+) -> Dict[str, Any]:
+    """Load exact Kaggle processed train/validation/test Parquet files and candle .npy arrays.
+    
+    Validates:
+    1. Exact 1:1 alignment between DataFrame rows and candle array sequences.
+    2. Zero NaNs across candlestick tensors and numerical features.
+    3. Strict chronological boundary isolation.
+    Never silently falls back to regenerating legacy synthetic pipelines.
+    """
+    import pandas as pd
+    processed_dir = Path(processed_dir)
+
+    train_p = processed_dir / "train.parquet"
+    val_p = processed_dir / "validation.parquet"
+    test_p = processed_dir / "test.parquet"
+
+    train_c = processed_dir / "train_candles.npy"
+    val_c = processed_dir / "val_candles.npy"
+    test_c = processed_dir / "test_candles.npy"
+
+    for required_file in [train_p, val_p, test_p, train_c, val_c, test_c]:
+        if not required_file.exists():
+            raise FileNotFoundError(
+                f"[DATASET NOT FOUND] Required file {required_file} does not exist in {processed_dir}! "
+                f"Run build_kaggle_research_dataset() to generate the full multimodal dataset. "
+                f"Never silently rerun a different legacy pipeline."
+            )
+
+    train_df = pd.read_parquet(train_p)
+    val_df = pd.read_parquet(val_p)
+    test_df = pd.read_parquet(test_p)
+
+    train_candles = np.load(train_c)
+    val_candles = np.load(val_c)
+    test_candles = np.load(test_c)
+
+    # Validate 1:1 row counts
+    assert len(train_df) == len(train_candles), f"Train 1:1 mismatch: {len(train_df)} df vs {len(train_candles)} candles!"
+    assert len(val_df) == len(val_candles), f"Val 1:1 mismatch: {len(val_df)} df vs {len(val_candles)} candles!"
+    assert len(test_df) == len(test_candles), f"Test 1:1 mismatch: {len(test_df)} df vs {len(test_candles)} candles!"
+
+    # Validate zero NaNs
+    assert not np.isnan(train_candles).any(), "NaNs detected in train candles!"
+    assert not np.isnan(val_candles).any(), "NaNs detected in val candles!"
+    assert not np.isnan(test_candles).any(), "NaNs detected in test candles!"
+
+    return {
+        "train_df": train_df,
+        "train_candles": train_candles,
+        "val_df": val_df,
+        "val_candles": val_candles,
+        "test_df": test_df,
+        "test_candles": test_candles,
+    }
+

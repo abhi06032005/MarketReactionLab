@@ -75,3 +75,9 @@ def get_market_dataloader(
         collate_fn=collate_fn,
         num_workers=num_workers,
     )
+
+
+# Export alias for Kaggle multimodal pipelines
+from src.training.kaggle_dataset import kaggle_multimodal_collate_fn
+multimodal_collate_fn = kaggle_multimodal_collate_fn
+

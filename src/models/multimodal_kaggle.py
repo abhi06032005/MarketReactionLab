@@ -26,17 +26,19 @@ class UnifiedReactionModel(nn.Module):
         mode: str = "partial_finetune_fusion",
         pretrained_bert: str = "ProsusAI/finbert",
         candle_model_type: str = "cnn",
-        num_indicators: int = 19,
+        num_indicators: int = 16,
         num_classes: int = 3,
         bert_hidden_dim: int = 768,
         candle_hidden_dim: int = 64,
         tab_hidden_dim: int = 64,
         fusion_dim: int = 128,
-        dropout_prob: float = 0.2
+        dropout_prob: float = 0.2,
+        num_features: Optional[int] = None,
     ):
         super().__init__()
         self.mode = mode.lower()
         self.num_classes = num_classes
+        self.num_indicators = num_features if num_features is not None else num_indicators
 
         # 1. FinBERT Backbone (for modes using text)
         if self.mode in ["news_only", "frozen_fusion", "partial_finetune_fusion", "full_finetune_fusion"]:
@@ -57,7 +59,7 @@ class UnifiedReactionModel(nn.Module):
         # 3. Tabular Technical Indicator Encoder (for modes using indicators)
         if self.mode in ["indicators_only", "frozen_fusion", "partial_finetune_fusion", "full_finetune_fusion"]:
             self.tabular_encoder = nn.Sequential(
-                nn.Linear(num_indicators, 64),
+                nn.Linear(self.num_indicators, 64),
                 nn.BatchNorm1d(64),
                 nn.GELU(),
                 nn.Dropout(dropout_prob),

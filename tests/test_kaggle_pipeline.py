@@ -52,15 +52,15 @@ def test_unified_model_unimodal_modes():
     """Verify UnifiedReactionModel in candles_only and indicators_only modes without downloading FinBERT."""
     batch_size = 4
     candles = torch.randn(batch_size, 30, 5)
-    indicators = torch.randn(batch_size, 19)
+    indicators = torch.randn(batch_size, 16)
 
     # Candles only mode
     model_candles = UnifiedReactionModel(mode="candles_only", num_classes=3)
     out_candles = model_candles(candles=candles)
     assert out_candles.shape == (batch_size, 3)
 
-    # Indicators only mode
-    model_ind = UnifiedReactionModel(mode="indicators_only", num_indicators=19, num_classes=3)
+    # Indicators only mode (16 technical features derived from schema)
+    model_ind = UnifiedReactionModel(mode="indicators_only", num_indicators=16, num_classes=3)
     out_ind = model_ind(indicators=indicators)
     assert out_ind.shape == (batch_size, 3)
 
@@ -151,12 +151,23 @@ def test_resolve_market_cutoff_sessions():
     assert tgt_idx == 2  # 2020-01-06 Close
     assert cat == "post_market"
 
-    # 4. Ambiguous Midnight: 2020-01-03 00:00:00 UTC
+    # 4. Ambiguous Midnight: treated as UNKNOWN publication time (not 00:00 intraday)
+    # 4a. Standard Date-Only Protocol: cutoff at close of D, predict D+1
     pub_utc = datetime(2020, 1, 3, 0, 0, 0, tzinfo=utc)
-    ref_idx, tgt_idx, cutoff, cat = resolve_market_cutoff_sessions(pub_utc, trading_dates, date_to_idx)
-    assert ref_idx is not None
-    assert tgt_idx == ref_idx + 1
-    assert cat == "ambiguous_midnight"
+    ref_idx, tgt_idx, cutoff, cat = resolve_market_cutoff_sessions(
+        pub_utc, trading_dates, date_to_idx, alignment_protocol="date_only_standard"
+    )
+    assert ref_idx == 1  # 2020-01-03 Close
+    assert tgt_idx == 2  # 2020-01-06 Close
+    assert cat == "date_only_unknown_time"
+
+    # 4b. Conservative Lag Sensitivity Protocol: cutoff at close of D+1, predict D+2
+    ref_idx_lag, tgt_idx_lag, cutoff_lag, cat_lag = resolve_market_cutoff_sessions(
+        pub_utc, trading_dates, date_to_idx, alignment_protocol="date_only_conservative_lag"
+    )
+    assert ref_idx_lag == 2  # 2020-01-06 Close
+    assert tgt_idx_lag == 3  # 2020-01-07 Close
+    assert cat_lag == "date_only_conservative_lag"
 
 
 def test_validate_and_normalize_candle_window_edge_cases():
@@ -433,6 +444,197 @@ def test_spy_1993_calendar_bound_regression():
     })
     with pytest.raises(ValueError, match="exceeds authoritative NYSE calendar range"):
         clean_and_align_stock_prices(oob_spy, "SPY_OOB", cal)
+
+
+def test_ticker_headline_attribution_filtering():
+    """Verify conservative ticker attribution filter removes false-positive mentions."""
+    from src.data.event_taxonomy import validate_ticker_headline_attribution
+
+    # Ticker A (Agilent) vs Thermo Fisher / competitor mentions
+    valid, reason = validate_ticker_headline_attribution("A", "Thermo Fisher Scientific Reports Q2 Earnings")
+    assert not valid and reason == "misattributed_a_thermo_fisher"
+
+    valid, reason = validate_ticker_headline_attribution("A", "Why Thermo Fisher Is A Great Pick For Healthcare")
+    assert not valid and reason == "misattributed_a_thermo_fisher"
+
+    valid, reason = validate_ticker_headline_attribution("A", "A Great Day For Global Markets")
+    assert not valid and reason == "misattributed_a_no_company_name"
+
+    valid, reason = validate_ticker_headline_attribution("A", "Agilent Technologies Introduces New Mass Spec Analyzer")
+    assert valid and reason is None
+
+    valid, reason = validate_ticker_headline_attribution("A", "Agilent Reports Strong Fourth Quarter Operating Margin")
+    assert valid and reason is None
+
+    # Ticker T (AT&T) vs T-Mobile
+    valid, reason = validate_ticker_headline_attribution("T", "T-Mobile US Expands 5G Network Rollout")
+    assert not valid and reason == "misattributed_t_tmobile"
+
+    valid, reason = validate_ticker_headline_attribution("T", "AT&T Declares Quarterly Dividend of 52 Cents")
+    assert valid and reason is None
+
+    # Single-letter ticker C (Citigroup)
+    valid, reason = validate_ticker_headline_attribution("C", "Vitamin C Deficiency Clinical Trial Results")
+    assert not valid and reason == "misattributed_c_no_company_name"
+
+    valid, reason = validate_ticker_headline_attribution("C", "Citigroup CEO Announces Investment Banking Restructuring")
+    assert valid and reason is None
+
+
+def test_multimodal_dataset_16_features_and_label_mapping():
+    """Verify 16-feature schema extraction, 1:1 candle alignment assertion, and reversible label mapping."""
+    # 16 technical features
+    feat_names = [f"feat_{i}" for i in range(16)]
+    data = {
+        "event_date": ["2020-01-02", "2020-01-03", "2020-01-06"],
+        "reaction_label": [-1, 0, 1],  # original labels
+        "excess_return": [-0.02, 0.001, 0.025],
+        "ticker": ["AAPL", "AAPL", "MSFT"],
+        "headline": ["Headline 1", "Headline 2", "Headline 3"],
+    }
+    for col in feat_names:
+        data[col] = [0.1, 0.2, 0.3]
+    df = pd.DataFrame(data)
+
+    candles = np.ones((3, 30, 5), dtype=np.float32)
+
+    ds = KaggleMultimodalDataset(df, candles_array=candles)
+    assert ds.num_features == 16
+    assert len(ds) == 3
+
+    # Label remapping {-1: 0, 0: 1, 1: 2}
+    assert ds[0]["label"].item() == 0  # -1 -> 0 (DOWN)
+    assert ds[1]["label"].item() == 1  # 0 -> 1 (NEUTRAL)
+    assert ds[2]["label"].item() == 2  # 1 -> 2 (UP)
+
+    # Reversible inverse map
+    assert ds.inverse_label_map[0] == -1
+    assert ds.inverse_label_map[1] == 0
+    assert ds.inverse_label_map[2] == 1
+
+    # Invariant: Length mismatch between DataFrame and candles must fail
+    bad_candles = np.ones((2, 30, 5), dtype=np.float32)
+    with pytest.raises(AssertionError, match=r"Candles count \(2\) != DataFrame rows \(3\)"):
+        KaggleMultimodalDataset(df, candles_array=bad_candles)
+
+    # Invariant: NaNs in candles must fail
+    nan_candles = np.ones((3, 30, 5), dtype=np.float32)
+    nan_candles[0, 5, 2] = np.nan
+    with pytest.raises(AssertionError, match=r"NaNs detected in input candles array"):
+        KaggleMultimodalDataset(df, candles_array=nan_candles)
+
+
+def test_load_processed_kaggle_dataset_validation(tmp_path):
+    """Verify load_processed_kaggle_dataset enforces 1:1 alignment and rejects missing files."""
+    from src.training.dataset import load_processed_kaggle_dataset
+
+    # 1. Missing files must raise FileNotFoundError and never fallback to synthetic generation
+    with pytest.raises(FileNotFoundError, match="Required file .* does not exist"):
+        load_processed_kaggle_dataset(tmp_path)
+
+    # 2. Valid files load cleanly
+    feat_cols = [f"feat_{i}" for i in range(16)]
+    row_data = {"event_date": ["2020-01-02", "2020-01-03"], "reaction_label": [1, -1]}
+    for c in feat_cols:
+        row_data[c] = [0.5, 0.5]
+    df = pd.DataFrame(row_data)
+    candles = np.ones((2, 30, 5), dtype=np.float32)
+
+    df.to_parquet(tmp_path / "train.parquet")
+    df.to_parquet(tmp_path / "validation.parquet")
+    df.to_parquet(tmp_path / "test.parquet")
+    np.save(tmp_path / "train_candles.npy", candles)
+    np.save(tmp_path / "val_candles.npy", candles)
+    np.save(tmp_path / "test_candles.npy", candles)
+
+    data = load_processed_kaggle_dataset(tmp_path)
+    assert len(data["train_df"]) == 2
+    assert data["train_candles"].shape == (2, 30, 5)
+
+
+def test_majority_class_baseline_calculation():
+    """Verify empirical class prior and majority class zero-rule baseline metrics."""
+    from src.training.kaggle_trainer import compute_majority_class_baseline
+
+    train_labels = np.array([0, 0, 0, 1, 2])  # class 0 is 60%
+    test_labels = np.array([0, 0, 1, 2])      # class 0 is 50%
+
+    res = compute_majority_class_baseline(train_labels, test_labels)
+    assert res["majority_class"] == 0
+    assert pytest.approx(res["accuracy"], rel=1e-3) == 0.50
+    assert 0.0 <= res["brier_score"] <= 2.0
+
+
+def test_smoke_training_check_fast(tmp_path):
+    """Verify fast smoke test path (< 3s) for forward, backward, eval, and checkpointing."""
+    from torch.utils.data import DataLoader
+    from src.training.kaggle_trainer import run_smoke_training_check, create_smoke_dataset
+
+    # Create synthetic dataset with 16 features
+    feat_cols = [f"feat_{i}" for i in range(16)]
+    data = {
+        "event_date": [f"2020-01-{i+1:02d}" for i in range(20)],
+        "reaction_label": [i % 3 - 1 for i in range(20)],
+        "excess_return": [0.01 * (i % 3 - 1) for i in range(20)],
+        "ticker": ["AAPL"] * 20,
+        "headline": ["Headline test"] * 20,
+    }
+    for c in feat_cols:
+        data[c] = [0.1] * 20
+    df = pd.DataFrame(data)
+    candles = np.ones((20, 30, 5), dtype=np.float32)
+
+    ds = KaggleMultimodalDataset(df, candles_array=candles)
+    smoke_train_ds = create_smoke_dataset(ds, num_samples=16)
+    smoke_val_ds = create_smoke_dataset(ds, num_samples=8)
+
+    train_loader = DataLoader(smoke_train_ds, batch_size=4, shuffle=True, collate_fn=kaggle_multimodal_collate_fn)
+    val_loader = DataLoader(smoke_val_ds, batch_size=4, shuffle=False, collate_fn=kaggle_multimodal_collate_fn)
+
+    model = UnifiedReactionModel(mode="indicators_only", num_indicators=16, num_classes=3)
+    res = run_smoke_training_check(
+        model=model,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        checkpoint_dir=tmp_path / "smoke_check",
+    )
+    assert res["status"] == "PASSED"
+    assert (tmp_path / "smoke_check" / "best_model.pt").exists()
+
+
+def test_trainer_session_level_evaluation(tmp_path):
+    """Verify evaluation reports metrics at both headline level and unique session level."""
+    from torch.utils.data import DataLoader
+    from src.training.kaggle_trainer import KaggleTrainer
+
+    # 4 samples, where session 1 has 3 headlines (1 primary, 2 duplicates) and session 2 has 1 headline (1 primary)
+    feat_cols = [f"feat_{i}" for i in range(16)]
+    data = {
+        "event_date": ["2020-01-02", "2020-01-02", "2020-01-02", "2020-01-03"],
+        "ticker": ["AAPL", "AAPL", "AAPL", "MSFT"],
+        "is_primary_session_sample": [True, False, False, True],
+        "reaction_label": [1, 1, 1, -1],
+        "excess_return": [0.02, 0.02, 0.02, -0.01],
+        "headline": ["H1", "H2", "H3", "H4"],
+    }
+    for c in feat_cols:
+        data[c] = [0.0] * 4
+    df = pd.DataFrame(data)
+    candles = np.ones((4, 30, 5), dtype=np.float32)
+
+    ds = KaggleMultimodalDataset(df, candles_array=candles)
+    loader = DataLoader(ds, batch_size=4, shuffle=False, collate_fn=kaggle_multimodal_collate_fn)
+
+    model = UnifiedReactionModel(mode="indicators_only", num_indicators=16, num_classes=3)
+    trainer = KaggleTrainer(model=model, checkpoint_dir=tmp_path / "eval_check")
+    eval_res = trainer.evaluate(loader)
+
+    # Check that both headline and session metrics exist
+    assert "accuracy" in eval_res
+    assert "session_accuracy" in eval_res
+    assert eval_res["unique_sessions"] == 2
+    assert eval_res["total_samples"] == 4
+
 
 
 

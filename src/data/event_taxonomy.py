@@ -1,7 +1,7 @@
 """Deterministic rule-based event taxonomy, multi-company detection, and price-movement filters."""
 
 import re
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 TAXONOMY_CATEGORIES = [
     "Earnings",
@@ -219,4 +219,68 @@ class EventTaxonomyClassifier(EventTaxonomy):
     def classify(self, headline: str) -> str:
         cat, _ = classify_event(headline)
         return cat
+
+
+# Conservative company name patterns for ambiguous single-letter and short tickers
+TICKER_COMPANY_PATTERNS = {
+    "A": re.compile(r"\bagilent\b", re.IGNORECASE),
+    "C": re.compile(r"\bciti(?:group)?\b", re.IGNORECASE),
+    "F": re.compile(r"\bford\b", re.IGNORECASE),
+    "K": re.compile(r"\bkellogg\b", re.IGNORECASE),
+    "T": re.compile(r"\bat&t\b|\batt\b", re.IGNORECASE),
+    "V": re.compile(r"\bvisa\b", re.IGNORECASE),
+}
+
+# Explicit competitor mentions that indicate a false tag when target company is absent
+TICKER_FALSE_TAG_PATTERNS = {
+    "A": re.compile(r"\bthermo\s*fisher\b|\btmo\b|\bdanaher\b|\bperkinelmer\b|\bwaters\s+corp\b", re.IGNORECASE),
+    "T": re.compile(r"\bt-mobile\b|\btmus\b|\bverizon\b|\bvz\b|\bsprint\b", re.IGNORECASE),
+}
+
+
+def validate_ticker_headline_attribution(ticker: str, headline: str) -> Tuple[bool, Optional[str]]:
+    """Audit ticker-to-headline mapping to reject misattributed ticker tags.
+    
+    Specifically handles:
+    1. Ticker 'A' (Agilent Technologies) falsely matched to English indefinite article 'a'
+       or headlines concerning Thermo Fisher Scientific / competitors.
+    2. Ticker 'T' (AT&T) falsely tagged to T-Mobile stories.
+    3. Single-letter tickers tagged on generic commentary without mentioning the target company.
+    
+    Returns (is_valid, rejection_reason). Note: This is a conservative filter, not a claim of
+    perfect entity matching.
+    """
+    if not headline or not ticker:
+        return False, "empty_headline_or_ticker"
+
+    ticker_upper = ticker.upper().strip()
+
+    # Special audit for ticker 'A' (Agilent)
+    if ticker_upper == "A":
+        has_agilent = bool(TICKER_COMPANY_PATTERNS["A"].search(headline))
+        has_thermo = bool(TICKER_FALSE_TAG_PATTERNS["A"].search(headline))
+        if has_thermo and not has_agilent:
+            return False, "misattributed_a_thermo_fisher"
+        if not has_agilent:
+            # Single-letter 'A' in headline is almost always an English word or false match
+            return False, "misattributed_a_no_company_name"
+
+    # Special audit for ticker 'T' (AT&T vs T-Mobile)
+    elif ticker_upper == "T":
+        has_att = bool(TICKER_COMPANY_PATTERNS["T"].search(headline))
+        has_tmobile = bool(TICKER_FALSE_TAG_PATTERNS["T"].search(headline))
+        if has_tmobile and not has_att:
+            return False, "misattributed_t_tmobile"
+
+    # General single-letter ticker audit (C, F, K, V)
+    elif ticker_upper in TICKER_COMPANY_PATTERNS:
+        company_pat = TICKER_COMPANY_PATTERNS[ticker_upper]
+        if not company_pat.search(headline):
+            # Check if exact ticker appears with market context (e.g., '(Symbol: C)' or 'NYSE:C')
+            context_match = re.search(rf"\b(?:symbol|nyse|nasdaq|ticker)[:\s]+{ticker_upper}\b", headline, re.IGNORECASE)
+            if not context_match:
+                return False, f"misattributed_{ticker_upper.lower()}_no_company_name"
+
+    return True, None
+
 

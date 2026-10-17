@@ -152,6 +152,19 @@ def process_matched_news_parquet(
         df = df[mask_non_retro]
         logger.info(f"Purged {before_count - len(df):,} retrospective leakage headlines. {len(df):,} remain.")
 
+    # Audit ticker-to-headline attribution (e.g. Agilent ticker A tagged on Thermo Fisher stories)
+    from src.data.event_taxonomy import validate_ticker_headline_attribution
+    attribution_results = [validate_ticker_headline_attribution(t, h) for t, h in zip(df["ticker"], df["headline"])]
+    valid_attrib_mask = [res[0] for res in attribution_results]
+    misattributed_count = len(df) - sum(valid_attrib_mask)
+    if misattributed_count > 0:
+        reasons = {}
+        for (is_valid, reason) in attribution_results:
+            if not is_valid and reason:
+                reasons[reason] = reasons.get(reason, 0) + 1
+        logger.info(f"Purged {misattributed_count:,} misattributed ticker headlines. Breakout: {reasons}")
+        df = df[valid_attrib_mask]
+
     df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce")
     df = df.dropna(subset=["published_at"])
     df = df.drop_duplicates(subset=["ticker", "headline"])

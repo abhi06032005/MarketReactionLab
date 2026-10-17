@@ -255,11 +255,21 @@ def clean_and_align_stock_prices(
 def resolve_market_cutoff_sessions(
     pub_dt_utc: datetime,
     trading_dates: List[pd.Timestamp],
-    date_to_idx: Dict[pd.Timestamp, int]
+    date_to_idx: Dict[pd.Timestamp, int],
+    alignment_protocol: str = "date_only_standard",
 ) -> Tuple[Optional[int], Optional[int], datetime, str]:
     """Resolve reference session, target session, and exact prediction cutoff.
     
-    News timestamps are UTC. Converted to America/New_York.
+    News timestamps in the raw dataset are predominantly midnight UTC (date-only).
+    These are treated as UNKNOWN publication times on the calendar date, NEVER assumed to be 00:00 intraday.
+    
+    Protocols:
+    - 'date_only_standard': End-of-day cutoff. News on calendar date D is assumed fully available
+      at the close of date D (16:00 NY). Reference session is date D (or prior session if holiday),
+      target session is D+1.
+    - 'date_only_conservative_lag': T+1 availability lag sensitivity experiment. If news on date D
+      might not be actionable until next day, cutoff is shifted to D+1 close, reference session is D+1,
+      target session is D+2.
     """
     if pub_dt_utc.tzinfo is None:
         pub_dt_utc = pub_dt_utc.replace(tzinfo=UTC_TZ)
@@ -277,12 +287,25 @@ def resolve_market_cutoff_sessions(
         intended_date = pd.Timestamp(pub_dt_utc.date()) if (pub_dt_utc.hour == 0 and pub_dt_utc.minute == 0) else ny_date
         past_dates = [d for d in trading_dates if d <= intended_date]
         if not past_dates:
-            return None, None, pub_dt_ny, "ambiguous_no_history"
-        ref_date = past_dates[-1]
-        ref_idx = date_to_idx[ref_date]
-        tgt_idx = ref_idx + 1
-        cutoff_dt = datetime.combine(ref_date.date(), MARKET_CLOSE, tzinfo=NY_TZ)
-        timing_category = "ambiguous_midnight"
+            return None, None, pub_dt_ny, "date_only_no_history"
+
+        if alignment_protocol == "date_only_conservative_lag":
+            # T+1 Information-Availability Lag Sensitivity Protocol:
+            base_idx = date_to_idx[past_dates[-1]]
+            ref_idx = base_idx + 1
+            tgt_idx = ref_idx + 1
+            if ref_idx >= len(trading_dates):
+                return None, None, pub_dt_ny, "lag_ref_session_oob"
+            ref_date = trading_dates[ref_idx]
+            cutoff_dt = datetime.combine(ref_date.date(), MARKET_CLOSE, tzinfo=NY_TZ)
+            timing_category = "date_only_conservative_lag"
+        else:
+            # Standard Date-Only Protocol: Cutoff at close of date D, predict D+1
+            ref_date = past_dates[-1]
+            ref_idx = date_to_idx[ref_date]
+            tgt_idx = ref_idx + 1
+            cutoff_dt = datetime.combine(ref_date.date(), MARKET_CLOSE, tzinfo=NY_TZ)
+            timing_category = "date_only_unknown_time"
         
     elif ny_time < MARKET_OPEN:
         # Pre-market
@@ -472,7 +495,29 @@ def run_preflight_diagnostic(
     except ValueError as e:
         assert "exceeds authoritative NYSE calendar range" in str(e)
 
-    logger.info("[PREFLIGHT PASSED] Price access, news schema, candle normalization, and NYSE calendar verified in 0.5s!")
+    # 12. Verify technical indicator dimension is exactly 16 (derived from schema, not hardcoded 19)
+    sample_feat_df = pd.DataFrame({
+        "date": pd.date_range("2020-01-01", periods=60, freq="B"),
+        "open": np.linspace(100, 110, 60),
+        "high": np.linspace(101, 111, 60),
+        "low": np.linspace(99, 109, 60),
+        "close": np.linspace(100, 110, 60),
+        "volume": np.full(60, 100000.0)
+    })
+    feat_df = compute_market_features(sample_feat_df)
+    computed_feat_cols = [c for c in feat_df.columns if c.startswith("feat_")]
+    assert len(computed_feat_cols) == 16, (
+        f"[PREFLIGHT FAILED] Expected 16 technical indicators, found {len(computed_feat_cols)}: {computed_feat_cols}"
+    )
+
+    # 13. Verify ticker attribution filter rejects misattributed ticker A on Thermo Fisher headlines
+    from src.data.event_taxonomy import validate_ticker_headline_attribution
+    valid_a, err_a = validate_ticker_headline_attribution("A", "Thermo Fisher Scientific to Acquire Analytical Instruments...")
+    assert not valid_a and err_a == "misattributed_a_thermo_fisher", f"Attribution test failed: {valid_a}, {err_a}"
+    valid_a_good, _ = validate_ticker_headline_attribution("A", "Agilent Reports Strong Q3 Financial Results")
+    assert valid_a_good, "Legitimate Agilent headline was rejected!"
+
+    logger.info("[PREFLIGHT PASSED] Price access, news schema, candle normalization, 16 features, and attribution filter verified in 0.5s!")
     return True
 
 
@@ -486,7 +531,8 @@ def build_kaggle_research_dataset(
     val_end_date: str = "2018-12-31",
     test_end_date: str = "2020-06-11",
     target_tickers: Optional[List[str]] = None,
-    filter_retrospective: bool = True
+    filter_retrospective: bool = True,
+    alignment_protocol: str = "date_only_standard",
 ) -> Dict[str, any]:
     """Assemble the large-scale research dataset with rigorous leakage prevention and NaN isolation."""
     output_dir = Path(output_dir)
@@ -554,6 +600,21 @@ def build_kaggle_research_dataset(
     news_df = news_df.drop_duplicates(subset=["ticker", "headline", "published_at"])
     logger.info(f"Deduplicated stories: removed {before_dedup - len(news_df):,} duplicates. {len(news_df):,} remain.")
 
+    # Audit and filter misattributed ticker tags (e.g. Agilent ticker A on Thermo Fisher stories)
+    from src.data.event_taxonomy import validate_ticker_headline_attribution
+    attribution_results = [validate_ticker_headline_attribution(t, h) for t, h in zip(news_df["ticker"], news_df["headline"])]
+    valid_attrib_mask = [res[0] for res in attribution_results]
+    purged_misattributed = len(news_df) - sum(valid_attrib_mask)
+    if purged_misattributed > 0:
+        attrib_reasons = {}
+        for (is_valid, reason) in attribution_results:
+            if not is_valid and reason:
+                attrib_reasons[reason] = attrib_reasons.get(reason, 0) + 1
+        logger.info(f"Purged {purged_misattributed:,} misattributed ticker headlines. Breakout: {attrib_reasons}")
+        news_df = news_df[valid_attrib_mask]
+    else:
+        purged_misattributed = 0
+
     # Classify event taxonomy
     logger.info("Classifying financial news event taxonomy...")
     taxonomy = EventTaxonomyClassifier()
@@ -618,6 +679,7 @@ def build_kaggle_research_dataset(
     skip_counter = {
         "placeholder_rows_removed": spy_stats["placeholder_rows_removed"],
         "genuine_session_gaps": spy_stats["genuine_session_gaps"],
+        "misattributed_ticker_tag": purged_misattributed,
         "insufficient_price_history": 0,
         "cutoff_resolution_failed": 0,
         "insufficient_candle_history": 0,
@@ -691,12 +753,13 @@ def build_kaggle_research_dataset(
             pdf["adj_close"] = adj_close_series
             pdf["adj_volume"] = raw_vol
 
-            # Compute 19 technical indicators
+            # Compute 16 backward-looking technical indicators
             pdf = compute_market_features(pdf)
 
             trading_dates = list(pdf["date"])
             date_to_idx = {d: i for i, d in enumerate(trading_dates)}
             feat_cols = [c for c in pdf.columns if c.startswith("feat_")]
+            assert len(feat_cols) == 16, f"Expected 16 technical features for {ticker}, found {len(feat_cols)}: {feat_cols}"
 
             t_news = news_df[news_df["ticker"] == ticker]
             seen_sessions: Set[str] = set()
@@ -712,7 +775,7 @@ def build_kaggle_research_dataset(
                     continue
 
                 ref_idx, tgt_idx, cutoff_dt, timing_cat = resolve_market_cutoff_sessions(
-                    pub_dt_raw, trading_dates, date_to_idx
+                    pub_dt_raw, trading_dates, date_to_idx, alignment_protocol=alignment_protocol
                 )
 
                 if ref_idx is None or tgt_idx is None:
@@ -813,6 +876,8 @@ def build_kaggle_research_dataset(
                     "published_at_utc": str(pub_dt_raw),
                     "prediction_cutoff_ny": cutoff_dt.isoformat(),
                     "timing_category": timing_cat,
+                    "timestamp_trust": "untrusted_date_only" if (timing_cat.startswith("date_only") or timing_cat == "ambiguous_midnight") else "trusted_intraday",
+                    "alignment_protocol": alignment_protocol,
                     "news_text": article["headline"],
                     "event_type": article["event_type"],
                     "reference_date": ref_date_str,
