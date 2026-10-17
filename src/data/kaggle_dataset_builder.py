@@ -19,12 +19,13 @@ import logging
 import os
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, List, Optional, Set, Tuple
 import zoneinfo
 from datetime import datetime, time
 
 import numpy as np
 import pandas as pd
+import exchange_calendars as xcals
 
 from src.data.event_taxonomy import EventTaxonomyClassifier
 from src.data.market_features import compute_market_features
@@ -131,6 +132,87 @@ def normalize_candle_sequence(candles: np.ndarray) -> np.ndarray:
     if norm is None:
         raise ValueError(f"Candle sequence failed validation: {err}")
     return norm
+
+
+def clean_and_align_stock_prices(
+    df: pd.DataFrame,
+    ticker: str,
+    nyse_cal: Any,
+) -> Tuple[pd.DataFrame, Dict[str, int]]:
+    """Clean and align raw stock price data against the authoritative NYSE calendar.
+    
+    1. Distinguishes non-trading-day placeholders from genuine trading-day gaps using NYSE calendar.
+    2. Removes invalid placeholder rows on verified exchange-closed dates (e.g. 2012-10-29 Hurricane Sandy,
+       2018-12-05 Bush Day of Mourning, 2018-01-01 New Year, 2017-02-20 Presidents Day).
+    3. Reindexes to genuine NYSE trading sessions within the stock's active date range.
+    4. For genuine trading-day gaps (e.g. 2020-04-02 for AXP/BMY), leaves missing values as NaNs.
+       Never invents prices, forward-fills, or backward-fills.
+    """
+    df = df.copy()
+    df.columns = [c.lower().strip() for c in df.columns]
+    if "date" not in df.columns or "close" not in df.columns:
+        raise ValueError(f"Required date/close columns missing for {ticker}")
+
+    df["date"] = pd.to_datetime(df["date"]).dt.tz_localize(None).dt.normalize()
+    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="first").reset_index(drop=True)
+
+    if len(df) == 0:
+        return df, {"placeholder_rows_removed": 0, "genuine_session_gaps": 0}
+
+    # Ensure numeric columns are coerced
+    for c in ["open", "high", "low", "close", "volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    close_col = "adj close" if "adj close" in df.columns else "close"
+    df[close_col] = pd.to_numeric(df[close_col], errors="coerce")
+
+    # Step 1: Distinguish NYSE session dates from non-session dates
+    date_strs = df["date"].dt.strftime("%Y-%m-%d").values
+    is_session_mask = np.array([nyse_cal.is_session(d) for d in date_strs], dtype=bool)
+
+    # Placeholder rows on verified exchange-closed dates
+    placeholder_mask = ~is_session_mask
+    placeholders_removed = int(placeholder_mask.sum())
+    if placeholders_removed > 0:
+        removed_dates = [date_strs[i] for i in np.where(placeholder_mask)[0]]
+        logger.info(
+            f"[{ticker}] Removed {placeholders_removed} non-trading-day placeholder row(s) on exchange-closed dates: {removed_dates}"
+        )
+
+    # Filter out non-trading-day rows
+    df = df[is_session_mask].reset_index(drop=True)
+
+    if len(df) == 0:
+        return df, {"placeholder_rows_removed": placeholders_removed, "genuine_session_gaps": 0}
+
+    # Step 2: Align against contiguous NYSE sessions in the range [min_date, max_date]
+    min_date_str = df["date"].min().strftime("%Y-%m-%d")
+    max_date_str = df["date"].max().strftime("%Y-%m-%d")
+
+    all_nyse_sessions = nyse_cal.sessions_in_range(min_date_str, max_date_str)
+    nyse_sessions_df = pd.DataFrame({
+        "date": pd.to_datetime(all_nyse_sessions).tz_localize(None).normalize()
+    })
+
+    # Left join ensures every genuine NYSE trading session is present in the sequence
+    aligned_df = pd.merge(nyse_sessions_df, df, on="date", how="left")
+
+    # Step 3: Audit genuine trading-day gaps
+    missing_session_mask = aligned_df["close"].isna()
+    genuine_gaps = int(missing_session_mask.sum())
+    if genuine_gaps > 0:
+        gap_dates = aligned_df.loc[missing_session_mask, "date"].dt.strftime("%Y-%m-%d").tolist()
+        logger.warning(
+            f"[{ticker}] Detected {genuine_gaps} genuine trading session gap(s) on active exchange day(s): {gap_dates}. "
+            f"These are preserved as unobserved (NaN) without forward-filling; affected 30-candle windows will be strictly rejected."
+        )
+
+    stats = {
+        "placeholder_rows_removed": placeholders_removed,
+        "genuine_session_gaps": genuine_gaps,
+    }
+    return aligned_df, stats
 
 
 def resolve_market_cutoff_sessions(
@@ -310,7 +392,15 @@ def run_preflight_diagnostic(
     assert norm_zr is None, "[PREFLIGHT FAILED] Zero ref close was not rejected!"
     assert err_zr in ("zero_price_ohlc", "invalid_ref_close")
 
-    logger.info("[PREFLIGHT PASSED] Price access, news schema, and candle normalization invariants verified in 0.5s!")
+    # 10. Authoritative NYSE Trading Calendar Verification
+    cal = xcals.get_calendar("XNYS")
+    assert not cal.is_session("2012-10-29"), "[PREFLIGHT FAILED] 2012-10-29 Sandy must be recognized as exchange closure!"
+    assert not cal.is_session("2018-12-05"), "[PREFLIGHT FAILED] 2018-12-05 Bush Day must be recognized as exchange closure!"
+    assert not cal.is_session("2018-01-01"), "[PREFLIGHT FAILED] 2018-01-01 New Year must be recognized as exchange closure!"
+    assert not cal.is_session("2017-02-20"), "[PREFLIGHT FAILED] 2017-02-20 Presidents Day must be recognized as exchange closure!"
+    assert cal.is_session("2020-04-02"), "[PREFLIGHT FAILED] 2020-04-02 must be recognized as genuine trading session!"
+
+    logger.info("[PREFLIGHT PASSED] Price access, news schema, candle normalization, and NYSE calendar verified in 0.5s!")
     return True
 
 
@@ -397,19 +487,16 @@ def build_kaggle_research_dataset(
     taxonomy = EventTaxonomyClassifier()
     news_df["event_type"] = news_df["headline"].apply(taxonomy.classify)
 
-    # 4. Load & Process SPY Benchmark Prices
-    logger.info(f"Loading SPY benchmark from {spy_path}...")
-    spy_df = pd.read_csv(spy_path)
-    spy_df.columns = [c.lower().strip() for c in spy_df.columns]
-    spy_df["date"] = pd.to_datetime(spy_df["date"]).dt.tz_localize(None)
-    spy_df = spy_df.dropna(subset=["date", "close"])
-    spy_df = spy_df[spy_df["close"] > 0]
-    spy_df = spy_df.sort_values("date").reset_index(drop=True)
-    
+    # 4. Load & Process SPY Benchmark Prices via Authoritative NYSE Calendar
+    logger.info(f"Loading and aligning SPY benchmark from {spy_path} using authoritative NYSE calendar...")
+    nyse_cal = xcals.get_calendar("XNYS")
+    raw_spy = pd.read_csv(spy_path)
+    spy_df, spy_stats = clean_and_align_stock_prices(raw_spy, "SPY", nyse_cal)
+
     spy_close_col = "adj close" if "adj close" in spy_df.columns else "close"
-    spy_df["spy_price"] = spy_df[spy_close_col].astype(float)
+    spy_df["spy_price"] = pd.to_numeric(spy_df[spy_close_col], errors="coerce").astype(float)
     spy_price_map = dict(zip(spy_df["date"].dt.strftime("%Y-%m-%d"), spy_df["spy_price"]))
-    spy_dates_set = set(spy_price_map.keys())
+    spy_dates_set = {d for d, p in spy_price_map.items() if np.isfinite(p) and p > 0}
 
     # 5. Audit Ticker File Availability
     unique_news_tickers = news_df["ticker"].unique()
@@ -431,6 +518,8 @@ def build_kaggle_research_dataset(
     candle_sequences = []
 
     skip_counter = {
+        "placeholder_rows_removed": spy_stats["placeholder_rows_removed"],
+        "genuine_session_gaps": spy_stats["genuine_session_gaps"],
         "insufficient_price_history": 0,
         "cutoff_resolution_failed": 0,
         "insufficient_candle_history": 0,
@@ -469,12 +558,10 @@ def build_kaggle_research_dataset(
             })
 
         try:
-            pdf = pd.read_csv(t_path)
-            pdf.columns = [c.lower().strip() for c in pdf.columns]
-            pdf["date"] = pd.to_datetime(pdf["date"]).dt.tz_localize(None).dt.normalize()
-
-            # Preserve chronological trading sessions without dropping missing dates upfront
-            pdf = pdf.sort_values("date").drop_duplicates(subset=["date"], keep="first").reset_index(drop=True)
+            raw_pdf = pd.read_csv(t_path)
+            pdf, align_stats = clean_and_align_stock_prices(raw_pdf, ticker, nyse_cal)
+            skip_counter["placeholder_rows_removed"] += align_stats["placeholder_rows_removed"]
+            skip_counter["genuine_session_gaps"] += align_stats["genuine_session_gaps"]
 
             if len(pdf) < candle_seq_len + 15:
                 record_skip("insufficient_price_history")

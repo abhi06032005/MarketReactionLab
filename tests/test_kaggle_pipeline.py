@@ -280,4 +280,81 @@ def test_session_candle_cache_memoization():
     assert reused_norm is cached_norm  # Exactly same cached object, 0 CPU overhead
 
 
+def test_nyse_calendar_special_closures_and_holidays():
+    """Verify authoritative NYSE calendar handles emergency closures, national mourning, and standard holidays."""
+    import exchange_calendars as xcals
+
+    cal = xcals.get_calendar("XNYS")
+
+    # 1. Special Emergency Closure: Hurricane Sandy (Oct 29-30, 2012)
+    assert not cal.is_session("2012-10-29"), "Hurricane Sandy closure Oct 29 must be non-session"
+    assert not cal.is_session("2012-10-30"), "Hurricane Sandy closure Oct 30 must be non-session"
+    assert cal.is_session("2012-10-26"), "Friday Oct 26 before Sandy was an active session"
+    assert cal.is_session("2012-10-31"), "Wednesday Oct 31 after Sandy was an active session"
+
+    # 2. National Day of Mourning: President George H.W. Bush (Dec 5, 2018)
+    assert not cal.is_session("2018-12-05"), "George H.W. Bush day of mourning must be non-session"
+    assert cal.is_session("2018-12-04"), "Dec 4, 2018 was an active session"
+    assert cal.is_session("2018-12-06"), "Dec 6, 2018 was an active session"
+
+    # 3. Standard Federal Market Holidays
+    assert not cal.is_session("2018-01-01"), "New Year's Day 2018 must be non-session"
+    assert not cal.is_session("2017-02-20"), "Washington's Birthday / Presidents' Day 2017 must be non-session"
+
+    # 4. Genuine Active Trading Session (e.g. 2020-04-02 where AXP and BMY had missing data)
+    assert cal.is_session("2020-04-02"), "April 2, 2020 was a genuine active NYSE trading session"
+
+
+def test_clean_and_align_stock_prices_placeholder_removal_and_genuine_gap():
+    """Verify that placeholder rows on exchange closures are dropped, while genuine trading-day gaps are preserved as NaNs."""
+    import exchange_calendars as xcals
+    from src.data.kaggle_dataset_builder import clean_and_align_stock_prices
+
+    cal = xcals.get_calendar("XNYS")
+
+    raw_df = pd.DataFrame({
+        "date": ["2012-10-26", "2012-10-29", "2012-10-31", "2020-04-01", "2020-04-02", "2020-04-03"],
+        "open": [100.0, np.nan, 102.0, 50.0, np.nan, 52.0],
+        "high": [105.0, np.nan, 106.0, 55.0, np.nan, 56.0],
+        "low": [95.0, np.nan, 98.0, 48.0, np.nan, 50.0],
+        "close": [102.0, np.nan, 104.0, 51.0, np.nan, 54.0],
+        "adj close": [102.0, np.nan, 104.0, 51.0, np.nan, 54.0],
+        "volume": [10000.0, np.nan, 12000.0, 20000.0, np.nan, 21000.0],
+    })
+
+    aligned_df, stats = clean_and_align_stock_prices(raw_df, ticker="TEST_TICKER", nyse_cal=cal)
+    aligned_dates = aligned_df["date"].dt.strftime("%Y-%m-%d").tolist()
+
+    # Invariant 1: Placeholder on closed date (2012-10-29 Sandy) must be REMOVED
+    assert "2012-10-29" not in aligned_dates, "Hurricane Sandy placeholder row was not removed!"
+    assert stats["placeholder_rows_removed"] >= 1
+
+    # Invariant 2: Genuine trading session (2020-04-02) must be PRESERVED as NaN, NOT dropped or forward-filled
+    assert "2020-04-02" in aligned_dates, "Genuine trading day 2020-04-02 was erroneously dropped!"
+    row_gap = aligned_df[aligned_df["date"] == pd.Timestamp("2020-04-02")].iloc[0]
+    assert np.isnan(row_gap["close"]), "Missing price on genuine session was forward-filled instead of preserved as NaN!"
+    assert stats["genuine_session_gaps"] >= 1
+
+
+def test_missing_genuine_session_window_rejection():
+    """Verify that a 30-candle window covering a genuine trading day gap (e.g. 2020-04-02) is strictly rejected."""
+    from src.data.kaggle_dataset_builder import validate_and_normalize_candle_window
+
+    seq_len = 30
+    window = np.ones((seq_len, 5), dtype=np.float32) * 80.0
+    # Day 15 corresponds to genuine trading day 2020-04-02 which has missing data (NaN)
+    window[15, :] = np.nan
+
+    norm, err = validate_and_normalize_candle_window(window, seq_len)
+    assert norm is None, "Window containing missing genuine trading day was not rejected!"
+    assert err == "nonfinite_ohlc"
+
+    # Adjacent window that does not include the missing day normalizes cleanly
+    clean_window = np.ones((seq_len, 5), dtype=np.float32) * 80.0
+    clean_norm, clean_err = validate_and_normalize_candle_window(clean_window, seq_len)
+    assert clean_norm is not None
+    assert clean_err is None
+    assert np.all(np.isfinite(clean_norm))
+
+
 
