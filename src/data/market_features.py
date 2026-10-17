@@ -262,3 +262,18 @@ def build_market_features(
     df_prices = pl.read_parquet(clean_prices_path)
     computer = MarketFeatureComputer(benchmark_symbol=benchmark_symbol)
     return computer.compute_all_with_benchmark(df_prices)
+
+
+def compute_market_features(pdf):
+    """Convenience helper to compute market features directly on a pandas price DataFrame."""
+    import polars as pl
+    lower_df = pdf.copy()
+    lower_df.columns = [c.lower() for c in lower_df.columns]
+    computer = MarketFeatureComputer()
+    pl_df = pl.from_pandas(lower_df)
+    feats = computer.compute_symbol_features(pl_df).to_pandas()
+    for col in FEATURE_COLUMNS:
+        if col in feats.columns:
+            pdf[f"feat_{col}"] = feats[col].values
+    return pdf
+

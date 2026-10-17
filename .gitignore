@@ -9,13 +9,37 @@ venv/
 ENV/
 .pytest_cache/
 
-# Data and Models
+# Secrets & Environment
+.env
+.env.*
+!.env.example
+*.key
+
+# Data and Raw Assets
 data/raw/
 data/interim/
 data/processed/*.parquet
 !data/processed/.gitkeep
+*.csv
+*.parquet
+*.npy
+*.npz
+*.h5
+
+# Model weights and checkpoints
 *.pt
+*.pth
 *.bin
+*.ckpt
+*.safetensors
+models/checkpoints/
+checkpoints/
+
+# Private Experimental Records & Logs
+logs/
+wandb/
+private/
+mlruns/
 
 # Reports figures
 reports/figures/

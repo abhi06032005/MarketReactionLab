@@ -212,3 +212,11 @@ class EventTaxonomy:
     @staticmethod
     def classify(headline: str) -> Tuple[str, float]:
         return classify_event(headline)
+
+
+class EventTaxonomyClassifier(EventTaxonomy):
+    """Classifier returning primary category string."""
+    def classify(self, headline: str) -> str:
+        cat, _ = classify_event(headline)
+        return cat
+
