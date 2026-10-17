@@ -16,7 +16,7 @@ class TradingCalendarAligner:
     """Manages NYSE session calendars and safe historical cutoff calculations."""
 
     def __init__(self, start_date: str = "2008-01-01", end_date: str = "2024-01-01"):
-        self.cal = xcals.get_calendar("XNYS")
+        self.cal = xcals.get_calendar("XNYS", start="1990-01-01", end="2030-01-01")
         sessions = self.cal.sessions_in_range(start_date, end_date)
         self.session_dates = [s.strftime("%Y-%m-%d") for s in sessions]
         self.session_set = set(self.session_dates)

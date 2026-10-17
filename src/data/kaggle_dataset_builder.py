@@ -138,14 +138,21 @@ def clean_and_align_stock_prices(
     df: pd.DataFrame,
     ticker: str,
     nyse_cal: Any,
+    research_start_date: Optional[str] = None,
+    research_end_date: Optional[str] = None,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
     """Clean and align raw stock price data against the authoritative NYSE calendar.
     
-    1. Distinguishes non-trading-day placeholders from genuine trading-day gaps using NYSE calendar.
-    2. Removes invalid placeholder rows on verified exchange-closed dates (e.g. 2012-10-29 Hurricane Sandy,
+    1. Restricts price history to the research study window ([research_start_date, research_end_date])
+       BEFORE evaluating exchange calendar sessions, preserving sufficient historical warm-up for
+       30-candle sequences and technical indicators while preventing out-of-bounds legacy data (e.g. 1993 SPY).
+    2. Validates that the authoritative NYSE calendar fully covers all dates in the candidate price sequence,
+       ensuring dates are NEVER silently misclassified as closures.
+    3. Distinguishes non-trading-day placeholders from genuine trading-day gaps using the NYSE calendar.
+    4. Removes invalid placeholder rows on verified exchange-closed dates (e.g. 2012-10-29 Hurricane Sandy,
        2018-12-05 Bush Day of Mourning, 2018-01-01 New Year, 2017-02-20 Presidents Day).
-    3. Reindexes to genuine NYSE trading sessions within the stock's active date range.
-    4. For genuine trading-day gaps (e.g. 2020-04-02 for AXP/BMY), leaves missing values as NaNs.
+    5. Reindexes to genuine contiguous NYSE trading sessions within the stock's active date range.
+    6. For genuine trading-day gaps (e.g. 2020-04-02 for AXP/BMY), preserves missing values as NaNs.
        Never invents prices, forward-fills, or backward-fills.
     """
     df = df.copy()
@@ -159,6 +166,36 @@ def clean_and_align_stock_prices(
     if len(df) == 0:
         return df, {"placeholder_rows_removed": 0, "genuine_session_gaps": 0}
 
+    # Step 0: Restrict to research-relevant date window with sufficient warm-up buffer
+    total_raw_rows = len(df)
+    if research_start_date is not None:
+        start_ts = pd.to_datetime(research_start_date).tz_localize(None).normalize()
+        df = df[df["date"] >= start_ts].reset_index(drop=True)
+
+    if research_end_date is not None:
+        end_ts = pd.to_datetime(research_end_date).tz_localize(None).normalize()
+        df = df[df["date"] <= end_ts].reset_index(drop=True)
+
+    trimmed_rows = total_raw_rows - len(df)
+    if trimmed_rows > 0:
+        logger.debug(f"[{ticker}] Trimmed {trimmed_rows:,} legacy/future rows outside research window [{research_start_date}, {research_end_date}].")
+
+    if len(df) == 0:
+        return df, {"placeholder_rows_removed": 0, "genuine_session_gaps": 0}
+
+    # Step 1: Explicit Calendar Boundary Verification (Never silently classify out-of-bounds dates as closures!)
+    cal_first = pd.Timestamp(nyse_cal.first_session).tz_localize(None).normalize()
+    cal_last = pd.Timestamp(nyse_cal.last_session).tz_localize(None).normalize()
+    df_min_date = df["date"].min()
+    df_max_date = df["date"].max()
+
+    if df_min_date < cal_first or df_max_date > cal_last:
+        raise ValueError(
+            f"[{ticker}] Price history span [{df_min_date.strftime('%Y-%m-%d')}, {df_max_date.strftime('%Y-%m-%d')}] "
+            f"exceeds authoritative NYSE calendar range [{cal_first.strftime('%Y-%m-%d')}, {cal_last.strftime('%Y-%m-%d')}]. "
+            f"Cannot determine session status without risking false exchange closure classifications."
+        )
+
     # Ensure numeric columns are coerced
     for c in ["open", "high", "low", "close", "volume"]:
         if c in df.columns:
@@ -167,7 +204,7 @@ def clean_and_align_stock_prices(
     close_col = "adj close" if "adj close" in df.columns else "close"
     df[close_col] = pd.to_numeric(df[close_col], errors="coerce")
 
-    # Step 1: Distinguish NYSE session dates from non-session dates
+    # Step 2: Distinguish NYSE session dates from non-session dates
     date_strs = df["date"].dt.strftime("%Y-%m-%d").values
     is_session_mask = np.array([nyse_cal.is_session(d) for d in date_strs], dtype=bool)
 
@@ -186,7 +223,7 @@ def clean_and_align_stock_prices(
     if len(df) == 0:
         return df, {"placeholder_rows_removed": placeholders_removed, "genuine_session_gaps": 0}
 
-    # Step 2: Align against contiguous NYSE sessions in the range [min_date, max_date]
+    # Step 3: Align against contiguous NYSE sessions in the range [min_date, max_date]
     min_date_str = df["date"].min().strftime("%Y-%m-%d")
     max_date_str = df["date"].max().strftime("%Y-%m-%d")
 
@@ -198,7 +235,7 @@ def clean_and_align_stock_prices(
     # Left join ensures every genuine NYSE trading session is present in the sequence
     aligned_df = pd.merge(nyse_sessions_df, df, on="date", how="left")
 
-    # Step 3: Audit genuine trading-day gaps
+    # Step 4: Audit genuine trading-day gaps
     missing_session_mask = aligned_df["close"].isna()
     genuine_gaps = int(missing_session_mask.sum())
     if genuine_gaps > 0:
@@ -392,13 +429,48 @@ def run_preflight_diagnostic(
     assert norm_zr is None, "[PREFLIGHT FAILED] Zero ref close was not rejected!"
     assert err_zr in ("zero_price_ohlc", "invalid_ref_close")
 
-    # 10. Authoritative NYSE Trading Calendar Verification
-    cal = xcals.get_calendar("XNYS")
+    # 10. Authoritative NYSE Trading Calendar Verification & Span Coverage
+    cal = xcals.get_calendar("XNYS", start="1990-01-01", end="2030-01-01")
+    cal_first = pd.Timestamp(cal.first_session).tz_localize(None).normalize()
+    cal_last = pd.Timestamp(cal.last_session).tz_localize(None).normalize()
+    assert cal_first <= pd.Timestamp("1990-01-05"), f"[PREFLIGHT FAILED] Calendar start {cal_first} does not cover 1990!"
+    assert cal_last >= pd.Timestamp("2029-12-25"), f"[PREFLIGHT FAILED] Calendar end {cal_last} does not cover 2030!"
+
     assert not cal.is_session("2012-10-29"), "[PREFLIGHT FAILED] 2012-10-29 Sandy must be recognized as exchange closure!"
     assert not cal.is_session("2018-12-05"), "[PREFLIGHT FAILED] 2018-12-05 Bush Day must be recognized as exchange closure!"
     assert not cal.is_session("2018-01-01"), "[PREFLIGHT FAILED] 2018-01-01 New Year must be recognized as exchange closure!"
     assert not cal.is_session("2017-02-20"), "[PREFLIGHT FAILED] 2017-02-20 Presidents Day must be recognized as exchange closure!"
     assert cal.is_session("2020-04-02"), "[PREFLIGHT FAILED] 2020-04-02 must be recognized as genuine trading session!"
+
+    # 11. Preflight Calendar Range & Research Trimming Verification
+    # Verify legacy dates (e.g. SPY from 1993) are correctly trimmed prior to calendar session testing
+    legacy_test_df = pd.DataFrame({
+        "date": ["1993-01-29", "1993-02-01", "2008-01-02", "2008-01-03"],
+        "open": [43.9, 44.0, 146.0, 145.0],
+        "high": [44.0, 44.2, 147.0, 146.0],
+        "low": [43.8, 43.9, 145.0, 144.0],
+        "close": [43.9, 44.1, 146.5, 145.5],
+        "adj close": [25.0, 25.1, 110.0, 109.0],
+        "volume": [1000.0, 2000.0, 3000.0, 4000.0],
+    })
+    trimmed_df, _ = clean_and_align_stock_prices(
+        legacy_test_df, "SPY_PREFLIGHT_TEST", cal,
+        research_start_date="2008-01-01",
+        research_end_date="2008-12-31"
+    )
+    assert len(trimmed_df) == 2, f"[PREFLIGHT FAILED] Legacy dates not correctly trimmed: {trimmed_df}"
+    assert "1993-01-29" not in trimmed_df["date"].dt.strftime("%Y-%m-%d").values
+
+    # Verify that out-of-bounds dates without trimming trigger explicit error rather than silent closure classification
+    oob_df = pd.DataFrame({
+        "date": ["1985-05-10"],
+        "open": [10.0], "high": [11.0], "low": [9.0], "close": [10.5], "volume": [100.0]
+    })
+    try:
+        clean_and_align_stock_prices(oob_df, "OOB_PREFLIGHT_TEST", cal)
+        raise AssertionError("[PREFLIGHT FAILED] Out-of-bounds date did not trigger calendar boundary assertion!")
+    except ValueError as e:
+        assert "exceeds authoritative NYSE calendar range" in str(e)
 
     logger.info("[PREFLIGHT PASSED] Price access, news schema, candle normalization, and NYSE calendar verified in 0.5s!")
     return True
@@ -487,11 +559,37 @@ def build_kaggle_research_dataset(
     taxonomy = EventTaxonomyClassifier()
     news_df["event_type"] = news_df["headline"].apply(taxonomy.classify)
 
+    # Derive documented research-relevant date window from actual news dates with ample historical warm-up
+    news_pub_dates = pd.to_datetime(news_df["published_at"], errors="coerce").dropna()
+    if len(news_pub_dates) > 0:
+        min_news_ts = news_pub_dates.min().tz_localize(None).normalize()
+        max_news_ts = news_pub_dates.max().tz_localize(None).normalize()
+        # Preserve 365 calendar days (~252 trading sessions) historical warm-up for 30-candle sequences & 35-day technical indicators
+        research_start_date = (min_news_ts - pd.Timedelta(days=365)).strftime("%Y-%m-%d")
+        # Cover forward-label horizon and evaluation period plus 30-day buffer
+        eval_end_ts = pd.to_datetime(test_end_date).tz_localize(None).normalize()
+        target_end_ts = max(max_news_ts, eval_end_ts)
+        research_end_date = (target_end_ts + pd.Timedelta(days=30)).strftime("%Y-%m-%d")
+    else:
+        research_start_date = "2007-01-01"
+        research_end_date = "2021-01-01"
+
+    logger.info(
+        f"Derived research study date window: [{research_start_date}, {research_end_date}] "
+        f"(Preserves 365-day warm-up for 30-candle sequences and technical indicators)."
+    )
+
     # 4. Load & Process SPY Benchmark Prices via Authoritative NYSE Calendar
-    logger.info(f"Loading and aligning SPY benchmark from {spy_path} using authoritative NYSE calendar...")
-    nyse_cal = xcals.get_calendar("XNYS")
+    logger.info(f"Loading and aligning SPY benchmark from {spy_path} using authoritative NYSE calendar [1990-2030]...")
+    nyse_cal = xcals.get_calendar("XNYS", start="1990-01-01", end="2030-01-01")
     raw_spy = pd.read_csv(spy_path)
-    spy_df, spy_stats = clean_and_align_stock_prices(raw_spy, "SPY", nyse_cal)
+    spy_df, spy_stats = clean_and_align_stock_prices(
+        raw_spy,
+        "SPY",
+        nyse_cal,
+        research_start_date=research_start_date,
+        research_end_date=research_end_date,
+    )
 
     spy_close_col = "adj close" if "adj close" in spy_df.columns else "close"
     spy_df["spy_price"] = pd.to_numeric(spy_df[spy_close_col], errors="coerce").astype(float)
@@ -559,7 +657,13 @@ def build_kaggle_research_dataset(
 
         try:
             raw_pdf = pd.read_csv(t_path)
-            pdf, align_stats = clean_and_align_stock_prices(raw_pdf, ticker, nyse_cal)
+            pdf, align_stats = clean_and_align_stock_prices(
+                raw_pdf,
+                ticker,
+                nyse_cal,
+                research_start_date=research_start_date,
+                research_end_date=research_end_date,
+            )
             skip_counter["placeholder_rows_removed"] += align_stats["placeholder_rows_removed"]
             skip_counter["genuine_session_gaps"] += align_stats["genuine_session_gaps"]
 

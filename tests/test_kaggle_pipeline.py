@@ -284,7 +284,7 @@ def test_nyse_calendar_special_closures_and_holidays():
     """Verify authoritative NYSE calendar handles emergency closures, national mourning, and standard holidays."""
     import exchange_calendars as xcals
 
-    cal = xcals.get_calendar("XNYS")
+    cal = xcals.get_calendar("XNYS", start="1990-01-01", end="2030-01-01")
 
     # 1. Special Emergency Closure: Hurricane Sandy (Oct 29-30, 2012)
     assert not cal.is_session("2012-10-29"), "Hurricane Sandy closure Oct 29 must be non-session"
@@ -310,7 +310,7 @@ def test_clean_and_align_stock_prices_placeholder_removal_and_genuine_gap():
     import exchange_calendars as xcals
     from src.data.kaggle_dataset_builder import clean_and_align_stock_prices
 
-    cal = xcals.get_calendar("XNYS")
+    cal = xcals.get_calendar("XNYS", start="1990-01-01", end="2030-01-01")
 
     raw_df = pd.DataFrame({
         "date": ["2012-10-26", "2012-10-29", "2012-10-31", "2020-04-01", "2020-04-02", "2020-04-03"],
@@ -355,6 +355,85 @@ def test_missing_genuine_session_window_rejection():
     assert clean_norm is not None
     assert clean_err is None
     assert np.all(np.isfinite(clean_norm))
+
+
+def test_spy_1993_calendar_bound_regression():
+    """Regression test: SPY price history beginning in 1993-01-29 aligned with research news starting in 2009.
+
+    Verifies:
+    1. Explicitly constructed XNYS calendar [1990-01-01, 2030-01-01] covers all dates.
+    2. clean_and_align_stock_prices trims legacy 1993-2007 rows before calling is_session().
+    3. Preserves 365-day historical warm-up (> 250 sessions) before the 2009 news date.
+    4. 30-candle sequence for a 2009 news cutoff is cleanly extracted and normalized without DateOutOfBounds.
+    5. Out-of-bounds dates (< 1990) without research trimming trigger an explicit exception and are never
+       silently misclassified as exchange closures.
+    """
+    import exchange_calendars as xcals
+    from src.data.kaggle_dataset_builder import clean_and_align_stock_prices, validate_and_normalize_candle_window
+
+    cal = xcals.get_calendar("XNYS", start="1990-01-01", end="2030-01-01")
+
+    # Generate synthetic SPY prices from 1993-01-29 through 2010-12-31
+    all_sessions = cal.sessions_in_range("1993-01-29", "2010-12-31")
+    session_strs = [s.strftime("%Y-%m-%d") for s in all_sessions]
+
+    n = len(session_strs)
+    rng = np.random.RandomState(42)
+    base_price = 45.0 + np.cumsum(rng.randn(n) * 0.5)
+    base_price = np.maximum(base_price, 20.0)
+
+    spy_df = pd.DataFrame({
+        "date": session_strs,
+        "open": base_price + 0.1,
+        "high": base_price + 0.5,
+        "low": base_price - 0.5,
+        "close": base_price,
+        "adj close": base_price * 0.8,
+        "volume": rng.randint(100000, 1000000, size=n).astype(float),
+    })
+
+    # Synthetic research news starts 2009-06-15, ends 2010-06-15
+    news_min_date = pd.Timestamp("2009-06-15")
+    news_max_date = pd.Timestamp("2010-06-15")
+
+    # Derive research window dynamically
+    research_start_date = (news_min_date - pd.Timedelta(days=365)).strftime("%Y-%m-%d")  # 2008-06-15
+    research_end_date = (news_max_date + pd.Timedelta(days=30)).strftime("%Y-%m-%d")     # 2010-07-15
+
+    # Clean SPY prices with research window
+    clean_spy, stats = clean_and_align_stock_prices(
+        spy_df, "SPY", cal,
+        research_start_date=research_start_date,
+        research_end_date=research_end_date,
+    )
+
+    # 1. Verify legacy 1993-2007 rows were trimmed
+    clean_dates = clean_spy["date"].dt.strftime("%Y-%m-%d").tolist()
+    assert "1993-01-29" not in clean_dates, "Legacy 1993 date was not trimmed!"
+    assert clean_dates[0] >= research_start_date, f"First date {clean_dates[0]} is before research start {research_start_date}"
+    assert clean_dates[-1] <= research_end_date, f"Last date {clean_dates[-1]} is after research end {research_end_date}"
+
+    # 2. Verify ample warm-up exists for 2009-06-15
+    news_date_str = "2009-06-15"
+    assert news_date_str in clean_dates
+    news_idx = clean_dates.index(news_date_str)
+    assert news_idx >= 30, f"Insufficient warm-up candles before news date: {news_idx}"
+
+    # 3. Extract and validate a 30-candle window for the news event
+    window_ohlcv = clean_spy.iloc[news_idx-29 : news_idx+1][["open", "high", "low", "close", "volume"]].values
+    norm_candles, err = validate_and_normalize_candle_window(window_ohlcv, expected_seq_len=30)
+    assert norm_candles is not None, f"Candle normalization failed: {err}"
+    assert norm_candles.shape == (30, 5)
+    assert np.all(np.isfinite(norm_candles))
+
+    # 4. Invariant: Out-of-bounds dates (< 1990) without trimming must raise ValueError, NEVER classify as closure
+    oob_spy = pd.DataFrame({
+        "date": ["1988-10-19"],  # Pre-1990 date
+        "open": [30.0], "high": [31.0], "low": [29.0], "close": [30.0], "volume": [1000.0]
+    })
+    with pytest.raises(ValueError, match="exceeds authoritative NYSE calendar range"):
+        clean_and_align_stock_prices(oob_spy, "SPY_OOB", cal)
+
 
 
 

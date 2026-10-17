@@ -65,7 +65,7 @@ cells = [
             "    %cd MarketReactionLab\n",
             "\n",
             "# 2. Install dependencies\n",
-            "!pip install -q transformers accelerate polars pyarrow scikit-learn tqdm\n",
+            "!pip install -q transformers accelerate polars pyarrow scikit-learn tqdm exchange_calendars\n",
             "\n",
             "# 3. Check GPU & compute environment\n",
             "import torch\n",
