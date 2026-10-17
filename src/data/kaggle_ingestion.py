@@ -76,6 +76,13 @@ def extract_target_prices(zip_path: Path, extract_dir: Path, target_symbols: Lis
     extracted_files: List[Path] = []
     symbol_set = {s.upper() for s in target_symbols}
     
+    # Check if already extracted
+    existing_files = list(extract_dir.glob("*.csv"))
+    existing_symbols = {f.stem.upper() for f in existing_files}
+    if len(existing_symbols.intersection(symbol_set)) >= len(symbol_set) * 0.8:
+        logger.info(f"Found {len(existing_files)} existing price CSVs in {extract_dir}. Skipping extraction.")
+        return [f for f in existing_files if f.stem.upper() in symbol_set]
+
     logger.info(f"Opening price archive {zip_path} for selective extraction of {len(symbol_set)} symbols...")
     with zipfile.ZipFile(zip_path, "r") as zf:
         name_list = zf.namelist()
@@ -95,6 +102,64 @@ def extract_target_prices(zip_path: Path, extract_dir: Path, target_symbols: Lis
                 
     logger.info(f"Extracted {len(extracted_files)} target price files to {extract_dir}.")
     return extracted_files
+
+
+def process_matched_news_parquet(
+    matched_parquet_path: Path,
+    output_parquet: Path,
+    target_symbols: Optional[List[str]] = None,
+    filter_retrospective: bool = True
+) -> int:
+    """Process existing matched_news.parquet with schemas: Date, Article_title, Stock_symbol, Url, Publisher."""
+    output_parquet.parent.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Loading pre-matched news from {matched_parquet_path}...")
+    df = pd.read_parquet(matched_parquet_path)
+    logger.info(f"Loaded {len(df):,} raw rows. Columns: {list(df.columns)}")
+
+    # Standardize column mapping
+    col_map = {}
+    for col in df.columns:
+        c_low = col.lower().strip()
+        if c_low in ["stock_symbol", "ticker", "symbol", "stock"]:
+            col_map[col] = "ticker"
+        elif c_low in ["article_title", "headline", "title", "text"]:
+            col_map[col] = "headline"
+        elif c_low in ["date", "published_at", "timestamp"]:
+            col_map[col] = "published_at"
+
+    df = df.rename(columns=col_map)
+    df["ticker"] = df["ticker"].astype(str).str.upper().str.strip()
+    df["headline"] = df["headline"].fillna("").astype(str).str.strip()
+
+    # Filter target symbols if provided
+    if target_symbols:
+        sym_set = {s.upper() for s in target_symbols}
+        df = df[df["ticker"].isin(sym_set)]
+        logger.info(f"Filtered to {len(df):,} rows matching target universe of {len(sym_set)} symbols.")
+
+    df = df[df["headline"].str.len() > 10]
+
+    if filter_retrospective:
+        import re
+        retrospective_patterns = [
+            r'\bplunges?\b', r'\bsurges?\b', r'\bup\s+\d+%', r'\bdown\s+\d+%',
+            r'\bgainers?\b', r'\blosers?\b', r'\bbiggest movers\b', r'\bslides?\b',
+            r'\brallies\b', r'\btumbles?\b', r'\bjumps?\b', r'\bdips?\b'
+        ]
+        retro_regex = re.compile('|'.join(retrospective_patterns), re.IGNORECASE)
+        mask_non_retro = ~df["headline"].apply(lambda t: bool(retro_regex.search(t)))
+        before_count = len(df)
+        df = df[mask_non_retro]
+        logger.info(f"Purged {before_count - len(df):,} retrospective leakage headlines. {len(df):,} remain.")
+
+    df["published_at"] = pd.to_datetime(df["published_at"], errors="coerce")
+    df = df.dropna(subset=["published_at"])
+    df = df.drop_duplicates(subset=["ticker", "headline"])
+    df = df.sort_values("published_at").reset_index(drop=True)
+
+    df.to_parquet(output_parquet, index=False, compression="snappy")
+    logger.info(f"Saved {len(df):,} clean news rows to {output_parquet}")
+    return len(df)
 
 
 def stream_and_filter_news(

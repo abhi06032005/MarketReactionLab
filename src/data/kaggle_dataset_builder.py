@@ -59,8 +59,10 @@ def build_kaggle_research_dataset(
     output_dir: Path,
     candle_seq_len: int = 30,
     label_threshold: float = 0.005,
-    holdout_start_date: str = "2021-01-01",
-    val_start_date: str = "2019-01-01"
+    train_end_date: str = "2017-12-31",
+    val_end_date: str = "2018-12-31",
+    test_end_date: str = "2020-06-11",
+    is_pristine_holdout: bool = False
 ) -> Dict[str, any]:
     """Assemble the large-scale research dataset with multimodal features."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -210,21 +212,25 @@ def build_kaggle_research_dataset(
     candle_arr = np.array(candle_sequences, dtype=np.float32)
     logger.info(f"Total aligned samples constructed: {len(df):,}")
 
-    # 4. Strict Chronological Partitioning
+    # 4. Strict Chronological Partitioning within verified coverage
     df["dt"] = pd.to_datetime(df["event_date"])
     
-    train_mask = df["dt"] < pd.to_datetime(val_start_date)
-    val_mask = (df["dt"] >= pd.to_datetime(val_start_date)) & (df["dt"] < pd.to_datetime(holdout_start_date))
-    test_mask = df["dt"] >= pd.to_datetime(holdout_start_date)
+    t_end = pd.to_datetime(train_end_date)
+    v_end = pd.to_datetime(val_end_date)
+    test_end = pd.to_datetime(test_end_date)
 
-    # In case data doesn't extend to holdout_start_date, fallback to 70/15/15 chronological quantile
-    if test_mask.sum() < 200:
-        logger.warning(f"Holdout date {holdout_start_date} yielded only {test_mask.sum()} samples. Using chronological 70/15/15 split.")
+    train_mask = df["dt"] <= t_end
+    val_mask = (df["dt"] > t_end) & (df["dt"] <= v_end)
+    test_mask = (df["dt"] > v_end) & (df["dt"] <= test_end)
+
+    # In case data doesn't align with explicit dates, fallback to 70/15/15 chronological quantile
+    if train_mask.sum() < 100 or val_mask.sum() < 50 or test_mask.sum() < 50:
+        logger.warning("Explicit dates yielded insufficient samples. Falling back to chronological 70/15/15 quantile split.")
         q70 = df["dt"].quantile(0.70)
         q85 = df["dt"].quantile(0.85)
-        train_mask = df["dt"] < q70
-        val_mask = (df["dt"] >= q70) & (df["dt"] < q85)
-        test_mask = df["dt"] >= q85
+        train_mask = df["dt"] <= q70
+        val_mask = (df["dt"] > q70) & (df["dt"] <= q85)
+        test_mask = df["dt"] > q85
 
     train_df = df[train_mask].drop(columns=["dt"]).reset_index(drop=True)
     val_df = df[val_mask].drop(columns=["dt"]).reset_index(drop=True)
@@ -233,6 +239,32 @@ def build_kaggle_research_dataset(
     train_candles = candle_arr[train_mask]
     val_candles = candle_arr[val_mask]
     test_candles = candle_arr[test_mask]
+
+    # Pre-training Integrity and Leakage Validation Assertions
+    logger.info("Executing pre-training dataset integrity validations...")
+    if len(train_df) == 0 or len(val_df) == 0 or len(test_df) == 0:
+        raise ValueError(f"Empty split detected! Train={len(train_df)}, Val={len(val_df)}, Test={len(test_df)}")
+
+    train_max = train_df["event_date"].max()
+    val_min = val_df["event_date"].min()
+    val_max = val_df["event_date"].max()
+    test_min = test_df["event_date"].min()
+
+    assert train_max < val_min, f"Chronological boundary leak: Train max {train_max} >= Val min {val_min}"
+    assert val_max < test_min, f"Chronological boundary leak: Val max {val_max} >= Test min {test_min}"
+
+    assert set(train_df["sample_id"]).isdisjoint(set(val_df["sample_id"])), "Train and Val sample IDs overlap!"
+    assert set(val_df["sample_id"]).isdisjoint(set(test_df["sample_id"])), "Val and Test sample IDs overlap!"
+    assert set(train_df["sample_id"]).isdisjoint(set(test_df["sample_id"])), "Train and Test sample IDs overlap!"
+
+    for s_name, s_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
+        unique_labels = set(s_df["reaction_label"].unique())
+        assert unique_labels.issubset({-1, 0, 1}), f"Invalid labels in {s_name}: {unique_labels}"
+        # Session precedence check
+        violations = (pd.to_datetime(s_df["reference_date"]) >= pd.to_datetime(s_df["target_date"])).sum()
+        assert violations == 0, f"Found {violations} session precedence violations in {s_name}!"
+
+    logger.info("All pre-training validation assertions passed successfully.")
 
     # Save outputs
     train_df.to_parquet(output_dir / "train.parquet", index=False)
@@ -251,6 +283,8 @@ def build_kaggle_research_dataset(
         "train_range": [str(train_df["event_date"].min()), str(train_df["event_date"].max())],
         "val_range": [str(val_df["event_date"].min()), str(val_df["event_date"].max())],
         "test_range": [str(test_df["event_date"].min()), str(test_df["event_date"].max())],
+        "is_pristine_holdout": is_pristine_holdout,
+        "holdout_notes": "FNSPID All_external.csv coverage terminates on 2020-06-11. The test partition (2019-01-01 to 2020-06-11) is an audited chronological evaluation set but was previously inspected during initial prototyping; not claimed as an untouched holdout.",
         "candle_shape": list(candle_arr.shape),
     }
 
@@ -259,3 +293,4 @@ def build_kaggle_research_dataset(
 
     logger.info(f"Dataset build complete: Train={len(train_df):,}, Val={len(val_df):,}, Test={len(test_df):,}")
     return manifest
+
