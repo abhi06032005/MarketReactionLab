@@ -1,0 +1,63 @@
+{
+  "dataset_name": "MarketReactionLab_Phase1",
+  "generated_at": "2026-10-17T13:57:53.065013",
+  "total_samples": 12871,
+  "symbols_count": 25,
+  "symbols": [
+    "A",
+    "AA",
+    "AAL",
+    "AAP",
+    "AAPL",
+    "ABC",
+    "ACN",
+    "ADBE",
+    "ADI",
+    "ADM",
+    "ADP",
+    "ADSK",
+    "AEO",
+    "AFL",
+    "AGN",
+    "AIG",
+    "AJG",
+    "ALB",
+    "ALK",
+    "ALL",
+    "ALTR",
+    "ALXN",
+    "AMAT",
+    "AMT",
+    "AMTD"
+  ],
+  "splits": {
+    "train": {
+      "count": 9110,
+      "earliest_date": "2009-04-28",
+      "latest_date": "2017-12-28",
+      "file": "data\\processed\\train.parquet"
+    },
+    "validation": {
+      "count": 1267,
+      "earliest_date": "2018-01-01",
+      "latest_date": "2018-12-30",
+      "file": "data\\processed\\validation.parquet"
+    },
+    "test": {
+      "count": 2494,
+      "earliest_date": "2019-01-01",
+      "latest_date": "2020-06-10",
+      "file": "data\\processed\\test.parquet"
+    }
+  },
+  "target": {
+    "task": "Next-session market-adjusted direction classification (UP/NEUTRAL/DOWN)",
+    "benchmark": "SPY",
+    "threshold": 0.005,
+    "label_mapping": {
+      "DOWN": 0,
+      "NEUTRAL": 1,
+      "UP": 2
+    }
+  }
+}

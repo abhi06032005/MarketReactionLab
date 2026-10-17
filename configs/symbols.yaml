@@ -1,0 +1,66 @@
+﻿# MarketReactionLab Symbol Configuration
+# Diverse universe of 25 liquid U.S. equities across sectors plus benchmark
+
+benchmark: "SPY"
+
+sectors:
+  technology:
+    - "ADBE"
+    - "ADSK"
+    - "ADI"
+    - "AMAT"
+    - "ALTR"
+    - "AAPL"
+  healthcare:
+    - "A"
+    - "AGN"
+    - "ABC"
+    - "ALXN"
+  financials:
+    - "AIG"
+    - "ALL"
+    - "AFL"
+    - "AMTD"
+    - "AJG"
+  consumer_discretionary:
+    - "AEO"
+    - "AAP"
+  consumer_staples:
+    - "ADM"
+  industrials:
+    - "AA"
+    - "ALB"
+    - "AAL"
+    - "ALK"
+  business_services:
+    - "ACN"
+    - "ADP"
+  real_estate:
+    - "AMT"
+
+primary_symbols:
+  - "A"
+  - "AA"
+  - "AAL"
+  - "AAP"
+  - "AAPL"
+  - "ABC"
+  - "ACN"
+  - "ADBE"
+  - "ADI"
+  - "ADM"
+  - "ADP"
+  - "ADSK"
+  - "AEO"
+  - "AFL"
+  - "AGN"
+  - "AIG"
+  - "AJG"
+  - "ALB"
+  - "ALK"
+  - "ALL"
+  - "ALTR"
+  - "ALXN"
+  - "AMAT"
+  - "AMT"
+  - "AMTD"

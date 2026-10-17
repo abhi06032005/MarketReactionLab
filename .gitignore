@@ -1,0 +1,30 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+.pytest_cache/
+
+# Data and Models
+data/raw/
+data/interim/
+data/processed/*.parquet
+!data/processed/.gitkeep
+*.pt
+*.bin
+
+# Reports figures
+reports/figures/
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+
+# OS files
+Thumbs.db
+.DS_Store

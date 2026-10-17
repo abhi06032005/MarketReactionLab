@@ -1,0 +1,33 @@
+{
+  "version": "1.0.0",
+  "numerical_features_count": 19,
+  "numerical_feature_names": [
+    "ret_1d",
+    "ret_3d",
+    "ret_5d",
+    "ret_10d",
+    "ret_20d",
+    "rolling_vol_20d",
+    "relative_volume",
+    "rolling_hl_range_20d",
+    "candle_body_ratio",
+    "upper_wick_ratio",
+    "lower_wick_ratio",
+    "rsi_14",
+    "macd",
+    "macd_signal",
+    "macd_hist",
+    "rel_perf_spy_20d",
+    "spy_ret_5d",
+    "spy_ret_20d",
+    "spy_vol_20d"
+  ],
+  "text_field": "news_text",
+  "id_field": "sample_id",
+  "ticker_field": "ticker",
+  "date_field": "event_date",
+  "target_return_field": "market_adjusted_return",
+  "target_label_field": "class_label",
+  "threshold": 0.005,
+  "benchmark_symbol": "SPY"
+}
