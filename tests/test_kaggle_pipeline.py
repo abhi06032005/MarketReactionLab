@@ -158,3 +158,72 @@ def test_resolve_market_cutoff_sessions():
     assert tgt_idx == ref_idx + 1
     assert cat == "ambiguous_midnight"
 
+
+def test_validate_and_normalize_candle_window_edge_cases():
+    """Verify strict handling of zero volume, constant prices, NaNs, Infs, and zero denominators."""
+    from src.data.kaggle_dataset_builder import validate_and_normalize_candle_window
+
+    seq_len = 30
+
+    # 1. Zero-volume days (all 30 days have zero volume)
+    zv_window = np.ones((seq_len, 5), dtype=np.float32) * 50.0
+    zv_window[:, 4] = 0.0  # zero volume
+    norm, err = validate_and_normalize_candle_window(zv_window, seq_len)
+    assert norm is not None, f"Zero volume window failed: {err}"
+    assert np.all(np.isfinite(norm))
+    assert np.all(norm[:, 4] == 0.0)  # log1p(0) = 0.0
+
+    # 2. Constant candle window (prices identical across all days)
+    const_window = np.ones((seq_len, 5), dtype=np.float32) * 125.0
+    norm_c, err_c = validate_and_normalize_candle_window(const_window, seq_len)
+    assert norm_c is not None, f"Constant window failed: {err_c}"
+    assert np.all(np.isfinite(norm_c))
+    assert np.all(norm_c[:, :4] == 1.0)  # price / ref_close = 1.0
+
+    # 3. Missing prices / NaN in window
+    nan_window = const_window.copy()
+    nan_window[15, 1] = np.nan  # NaN High on day 15
+    norm_nan, err_nan = validate_and_normalize_candle_window(nan_window, seq_len)
+    assert norm_nan is None
+    assert err_nan == "raw_candle_contains_nan_or_inf"
+
+    # 4. Inf in window
+    inf_window = const_window.copy()
+    inf_window[5, 4] = np.inf  # Inf volume
+    norm_inf, err_inf = validate_and_normalize_candle_window(inf_window, seq_len)
+    assert norm_inf is None
+    assert err_inf == "raw_candle_contains_nan_or_inf"
+
+    # 5. Non-positive price (0.0 or negative)
+    zero_price_window = const_window.copy()
+    zero_price_window[10, 3] = 0.0  # Zero close
+    norm_zp, err_zp = validate_and_normalize_candle_window(zero_price_window, seq_len)
+    assert norm_zp is None
+    assert err_zp == "non_positive_price_in_window"
+
+    neg_price_window = const_window.copy()
+    neg_price_window[8, 0] = -10.0  # Negative open
+    norm_np, err_np = validate_and_normalize_candle_window(neg_price_window, seq_len)
+    assert norm_np is None
+    assert err_np == "non_positive_price_in_window"
+
+    # 6. Negative volume
+    neg_vol_window = const_window.copy()
+    neg_vol_window[2, 4] = -500.0
+    norm_nv, err_nv = validate_and_normalize_candle_window(neg_vol_window, seq_len)
+    assert norm_nv is None
+    assert err_nv == "negative_volume_in_window"
+
+    # 7. Zero reference close (last day close <= 0)
+    zero_ref_window = const_window.copy()
+    zero_ref_window[-1, 3] = 0.0
+    norm_zr, err_zr = validate_and_normalize_candle_window(zero_ref_window, seq_len)
+    assert norm_zr is None
+
+    # 8. Invalid shape (29 rows instead of 30)
+    short_window = const_window[:29]
+    norm_short, err_short = validate_and_normalize_candle_window(short_window, seq_len)
+    assert norm_short is None
+    assert "invalid_shape" in err_short
+
+

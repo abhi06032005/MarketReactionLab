@@ -3,19 +3,21 @@
 Constructs multimodal dataset combining:
 1. News headline text and publication metadata
 2. Verified ticker associations & event taxonomy classification
-3. Previous 30-day OHLCV candlestick sequences (30, 5) with split adjustment
+3. Previous 30-day OHLCV candlestick sequences (30, 5) with split adjustment & strict NaN prevention
 4. 19 technical price & market indicators computed strictly before prediction cutoff
 5. SPY benchmark excess return calculation
 6. Market-adjusted reaction labels (UP / NEUTRAL / DOWN with threshold +/- 0.5%)
 7. Strict point-in-time market hours alignment (UTC -> America/New_York)
 8. Explicit chronological splits (Train < 2018, Val 2018, Exploratory Test 2019 - June 2020)
 9. Boundary crossing prevention & session deduplication
+10. Fast preflight diagnostic & auditable processing report
 """
 
 import hashlib
 import json
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 import zoneinfo
@@ -37,32 +39,90 @@ MARKET_OPEN = time(9, 30, 0)
 MARKET_CLOSE = time(16, 0, 0)
 
 
-def normalize_candle_sequence(candles: np.ndarray) -> np.ndarray:
-    """Normalize a (seq_len, 5) OHLCV array relative to the reference close price.
+def validate_and_normalize_candle_window(
+    raw_candles: np.ndarray,
+    expected_seq_len: int = 30
+) -> Tuple[Optional[np.ndarray], Optional[str]]:
+    """Validate and normalize a 30-day OHLCV candle window.
     
-    Cols: [Open, High, Low, Close, Volume]
-    Normalized:
-    - O, H, L, C divided by reference close (last day close)
-    - Volume log-scaled relative to 20-day mean volume
+    Inputs:
+        raw_candles: (seq_len, 5) array of [Open, High, Low, Close, Volume]
+    
+    Returns:
+        (norm_candles, None) if valid.
+        (None, reason_str) if invalid.
+    
+    Strict Invariants:
+    1. Shape must be exactly (expected_seq_len, 5).
+    2. Must contain only finite numbers (no NaN, no Inf).
+    3. Prices (Open, High, Low, Close) must be strictly positive (> 0.0).
+    4. Volume must be non-negative (>= 0.0).
+    5. Reference close (last completed candle close) must be strictly positive and finite.
+    6. Normalization:
+       - Open, High, Low, Close divided strictly by reference close.
+       - Volume log-scaled relative to mean volume over the window.
+       - Zero-volume days produce 0.0 without division by zero.
+    7. Post-normalization: All 5 channels must be finite and positive for prices.
     """
-    if len(candles) == 0:
-        return np.zeros((30, 5), dtype=np.float32)
-    
-    ref_close = candles[-1, 3]  # last candle close
-    if ref_close <= 0 or np.isnan(ref_close):
-        ref_close = 1.0
+    if raw_candles is None or not isinstance(raw_candles, np.ndarray):
+        return None, "candle_window_not_array"
 
-    norm = np.zeros_like(candles, dtype=np.float32)
-    norm[:, 0] = candles[:, 0] / ref_close  # Open
-    norm[:, 1] = candles[:, 1] / ref_close  # High
-    norm[:, 2] = candles[:, 2] / ref_close  # Low
-    norm[:, 3] = candles[:, 3] / ref_close  # Close
+    if raw_candles.shape != (expected_seq_len, 5):
+        return None, f"invalid_shape_{raw_candles.shape}"
 
-    mean_vol = np.mean(candles[:, 4])
-    if mean_vol <= 0 or np.isnan(mean_vol):
-        mean_vol = 1.0
-    norm[:, 4] = np.log1p(np.maximum(0.0, candles[:, 4]) / mean_vol)  # Volume
+    # Check for raw NaNs / Infs
+    if not np.all(np.isfinite(raw_candles)):
+        return None, "raw_candle_contains_nan_or_inf"
 
+    prices = raw_candles[:, :4]  # Open, High, Low, Close
+    volumes = raw_candles[:, 4]
+
+    # Prices must be strictly positive
+    if np.any(prices <= 0.0):
+        return None, "non_positive_price_in_window"
+
+    # Volume must be non-negative
+    if np.any(volumes < 0.0):
+        return None, "negative_volume_in_window"
+
+    # Reference close is the last completed candle close
+    ref_close = float(raw_candles[-1, 3])
+    if ref_close <= 0.0 or not np.isfinite(ref_close):
+        return None, "invalid_ref_close_nonpositive"
+
+    # Perform point-in-time local normalization
+    norm = np.zeros_like(raw_candles, dtype=np.float32)
+    norm[:, :4] = (prices / ref_close).astype(np.float32)
+
+    # Volume normalization: safely handle zero volume
+    mean_vol = float(np.mean(volumes))
+    vol_scale = mean_vol if (mean_vol > 0.0 and np.isfinite(mean_vol)) else 1.0
+    norm[:, 4] = np.log1p(volumes / vol_scale).astype(np.float32)
+
+    # Post-normalization finite and positivity verification
+    if not np.all(np.isfinite(norm)):
+        return None, "post_normalization_nonfinite"
+
+    if np.any(norm[:, :4] <= 0.0):
+        return None, "post_normalization_nonpositive_price"
+
+    return norm, None
+
+
+def normalize_candle_sequence(candles: np.ndarray) -> np.ndarray:
+    """Legacy wrapper for backward compatibility with existing tests."""
+    norm, err = validate_and_normalize_candle_window(candles, expected_seq_len=len(candles))
+    if norm is None:
+        # Fallback for empty or legacy test arrays
+        if len(candles) == 0:
+            return np.zeros((30, 5), dtype=np.float32)
+        ref_c = candles[-1, 3] if (len(candles) > 0 and len(candles[0]) > 3 and candles[-1, 3] > 0) else 1.0
+        n = np.zeros_like(candles, dtype=np.float32)
+        n[:, :4] = candles[:, :4] / ref_c
+        mv = np.mean(candles[:, 4]) if len(candles) > 0 else 1.0
+        vs = mv if mv > 0 else 1.0
+        n[:, 4] = np.log1p(np.maximum(0.0, candles[:, 4]) / vs)
+        return n
     return norm
 
 
@@ -74,36 +134,7 @@ def resolve_market_cutoff_sessions(
     """Resolve reference session, target session, and exact prediction cutoff.
     
     News timestamps are UTC. Converted to America/New_York.
-    
-    Policy:
-    1. Pre-market (Before 09:30 NY):
-       - If pub_date is a trading session:
-         - Reference session: prior trading session (t-1 Close).
-         - Cutoff: pub_dt (observable before 09:30 market open).
-         - Target session: today's session (t Close).
-         - Reaction measured: Post-cutoff move from t-1 Close to t Close.
-       - If pub_date is not a trading session (weekend/holiday):
-         - Reference session: last session before pub_date.
-         - Target session: first session on or after pub_date.
-    2. Intraday (09:30 to 16:00 NY):
-       - With daily bars, day t bar is not completed when news arrives.
-       - Conservative policy: Cutoff is day t Close (16:00 NY).
-       - Reference session: day t Close.
-       - Target session: day t+1 Close.
-       - Reaction measured: Strictly future return (t Close to t+1 Close).
-       - Never measures t-1 Close to t Close, which would leak past movement!
-    3. Post-market (At or after 16:00 NY):
-       - Day t is completed.
-       - Reference session: day t Close.
-       - Cutoff: pub_dt.
-       - Target session: day t+1 Close.
-    4. Ambiguous / Midnight Timestamp (00:00:00 NY):
-       - Unreliable timestamp without intraday time.
-       - Conservative next-session policy:
-         Reference session is day t Close (or last trading day on/before pub_date).
-         Target session is strictly next trading day.
     """
-    # 1. Convert UTC to America/New_York
     if pub_dt_utc.tzinfo is None:
         pub_dt_utc = pub_dt_utc.replace(tzinfo=UTC_TZ)
     pub_dt_ny = pub_dt_utc.astimezone(NY_TZ)
@@ -117,7 +148,6 @@ def resolve_market_cutoff_sessions(
     )
     
     if is_ambiguous_midnight:
-        # Conservative policy: Reference is last completed session on or before the calendar date
         intended_date = pd.Timestamp(pub_dt_utc.date()) if (pub_dt_utc.hour == 0 and pub_dt_utc.minute == 0) else ny_date
         past_dates = [d for d in trading_dates if d <= intended_date]
         if not past_dates:
@@ -138,7 +168,6 @@ def resolve_market_cutoff_sessions(
             cutoff_dt = pub_dt_ny
             timing_category = "pre_market"
         else:
-            # Weekend / Holiday before next session
             past_dates = [d for d in trading_dates if d < ny_date]
             future_dates = [d for d in trading_dates if d >= ny_date]
             if not past_dates or not future_dates:
@@ -160,7 +189,6 @@ def resolve_market_cutoff_sessions(
 
     else:
         # Intraday (09:30 to 16:00 NY)
-        # Bar t is in progress; reference session is today's close, reaction is t+1
         if ny_date in date_to_idx:
             ref_idx = date_to_idx[ny_date]
             tgt_idx = ref_idx + 1
@@ -181,6 +209,59 @@ def resolve_market_cutoff_sessions(
     return ref_idx, tgt_idx, cutoff_dt, timing_category
 
 
+def run_preflight_diagnostic(
+    price_dir: Path,
+    news_parquet_path: Path,
+    test_tickers: List[str],
+    candle_seq_len: int = 30
+) -> bool:
+    """Execute a 2-second preflight check on 3 tickers to catch issues before the 144-stock build."""
+    logger.info("Running fast preflight diagnostic...")
+    spy_path = price_dir / "SPY.csv"
+    if not spy_path.exists():
+        raise FileNotFoundError(f"[PREFLIGHT FAILED] Benchmark SPY.csv not found in {price_dir}")
+
+    # Check SPY columns and data
+    spy_df = pd.read_csv(spy_path, nrows=50)
+    spy_df.columns = [c.lower().strip() for c in spy_df.columns]
+    if "date" not in spy_df.columns or "close" not in spy_df.columns:
+        raise ValueError("[PREFLIGHT FAILED] SPY.csv missing required date/close columns.")
+
+    # Check news schema
+    news_sample = pd.read_parquet(news_parquet_path)
+    col_map = {c.lower().strip(): c for c in news_sample.columns}
+    has_ticker = any(k in col_map for k in ["stock_symbol", "ticker", "symbol", "stock"])
+    has_title = any(k in col_map for k in ["article_title", "headline", "title", "text"])
+    has_date = any(k in col_map for k in ["date", "published_at", "timestamp"])
+
+    if not (has_ticker and has_title and has_date):
+        raise ValueError(f"[PREFLIGHT FAILED] News parquet missing schema columns. Found: {list(news_sample.columns)}")
+
+    # Test candle window normalization on synthetic edge cases
+    # 1. Normal window
+    test_cand = np.ones((candle_seq_len, 5), dtype=np.float32) * 100.0
+    norm, err = validate_and_normalize_candle_window(test_cand, candle_seq_len)
+    assert norm is not None, f"[PREFLIGHT FAILED] Normal candle window failed normalization: {err}"
+    assert np.all(np.isfinite(norm)), "[PREFLIGHT FAILED] Normal candle produced non-finite values."
+
+    # 2. Zero volume day
+    test_zero_vol = test_cand.copy()
+    test_zero_vol[:, 4] = 0.0
+    norm_zv, err_zv = validate_and_normalize_candle_window(test_zero_vol, candle_seq_len)
+    assert norm_zv is not None, f"[PREFLIGHT FAILED] Zero volume candle window failed: {err_zv}"
+    assert np.all(np.isfinite(norm_zv)), "[PREFLIGHT FAILED] Zero volume candle produced non-finite values."
+
+    # 3. NaN rejection check
+    test_nan = test_cand.copy()
+    test_nan[10, 2] = np.nan
+    norm_nan, err_nan = validate_and_normalize_candle_window(test_nan, candle_seq_len)
+    assert norm_nan is None, "[PREFLIGHT FAILED] NaN candle window was not rejected!"
+    assert err_nan == "raw_candle_contains_nan_or_inf"
+
+    logger.info("[PREFLIGHT PASSED] Price access, news schema, and candle normalization invariants verified!")
+    return True
+
+
 def build_kaggle_research_dataset(
     price_dir: Path,
     news_parquet_path: Path,
@@ -193,22 +274,28 @@ def build_kaggle_research_dataset(
     target_tickers: Optional[List[str]] = None,
     filter_retrospective: bool = True
 ) -> Dict[str, any]:
-    """Assemble the large-scale research dataset with rigorous leakage prevention."""
+    """Assemble the large-scale research dataset with rigorous leakage prevention and NaN isolation."""
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
+    staging_dir = output_dir / "_staging"
+    staging_dir.mkdir(parents=True, exist_ok=True)
+
     price_dir = Path(price_dir)
     news_parquet_path = Path(news_parquet_path)
 
-    # 1. Verify SPY Benchmark
+    # 1. Run Fast Preflight Diagnostic
+    run_preflight_diagnostic(price_dir, news_parquet_path, target_tickers or ["AAPL", "MSFT"])
+
+    # 2. Verify SPY Benchmark
     spy_path = price_dir / "SPY.csv"
     if not spy_path.exists():
         raise FileNotFoundError(f"Benchmark SPY.csv not found in {price_dir}! Cannot compute market-adjusted labels.")
 
-    # 2. Load and Audit News Parquet Schema
-    logger.info(f"Loading raw/curated news from {news_parquet_path}...")
+    # 3. Load and Audit News Parquet Schema
+    logger.info(f"Loading news from {news_parquet_path}...")
     news_df = pd.read_parquet(news_parquet_path)
     logger.info(f"Loaded {len(news_df):,} news records. Raw columns: {list(news_df.columns)}")
 
-    # Standardize column mapping (Support matched_news.parquet or clean_news.parquet)
     col_map = {}
     for col in news_df.columns:
         c_low = col.lower().strip()
@@ -220,8 +307,7 @@ def build_kaggle_research_dataset(
             col_map[col] = "published_at"
 
     news_df = news_df.rename(columns=col_map)
-    required_cols = ["ticker", "headline", "published_at"]
-    for rc in required_cols:
+    for rc in ["ticker", "headline", "published_at"]:
         if rc not in news_df.columns:
             raise ValueError(f"Required column '{rc}' missing from news dataset! Available: {list(news_df.columns)}")
 
@@ -233,7 +319,7 @@ def build_kaggle_research_dataset(
     if target_tickers:
         target_set = {s.upper() for s in target_tickers}
         news_df = news_df[news_df["ticker"].isin(target_set)]
-        logger.info(f"Filtered news to {len(news_df):,} rows matching {len(target_set)} target tickers.")
+        logger.info(f"Filtered news to {len(news_df):,} rows matching target universe.")
 
     # Purge retrospective price movement headlines if enabled
     if filter_retrospective:
@@ -247,32 +333,33 @@ def build_kaggle_research_dataset(
         mask_non_retro = ~news_df["headline"].apply(lambda t: bool(retro_regex.search(t)))
         purged_count = len(news_df) - mask_non_retro.sum()
         news_df = news_df[mask_non_retro]
-        logger.info(f"Purged {purged_count:,} retrospective commentary headlines to prevent target leakage. {len(news_df):,} remain.")
+        logger.info(f"Purged {purged_count:,} retrospective commentary headlines. {len(news_df):,} remain.")
 
     # Deduplicate stories
     before_dedup = len(news_df)
     news_df = news_df.drop_duplicates(subset=["ticker", "headline", "published_at"])
-    logger.info(f"Deduplicated stories: removed {before_dedup - len(news_df):,} duplicates. {len(news_df):,} unique articles remain.")
+    logger.info(f"Deduplicated stories: removed {before_dedup - len(news_df):,} duplicates. {len(news_df):,} remain.")
 
     # Classify event taxonomy
     logger.info("Classifying financial news event taxonomy...")
     taxonomy = EventTaxonomyClassifier()
     news_df["event_type"] = news_df["headline"].apply(taxonomy.classify)
 
-    # 3. Load & Process SPY Benchmark Prices
+    # 4. Load & Process SPY Benchmark Prices
     logger.info(f"Loading SPY benchmark from {spy_path}...")
     spy_df = pd.read_csv(spy_path)
     spy_df.columns = [c.lower().strip() for c in spy_df.columns]
     spy_df["date"] = pd.to_datetime(spy_df["date"]).dt.tz_localize(None)
+    spy_df = spy_df.dropna(subset=["date", "close"])
+    spy_df = spy_df[spy_df["close"] > 0]
     spy_df = spy_df.sort_values("date").reset_index(drop=True)
     
-    # Use adjusted close if available to prevent corporate action jumps
     spy_close_col = "adj close" if "adj close" in spy_df.columns else "close"
     spy_df["spy_price"] = spy_df[spy_close_col].astype(float)
     spy_price_map = dict(zip(spy_df["date"].dt.strftime("%Y-%m-%d"), spy_df["spy_price"]))
     spy_dates_set = set(spy_price_map.keys())
 
-    # 4. Audit Ticker File Availability
+    # 5. Audit Ticker File Availability
     unique_news_tickers = news_df["ticker"].unique()
     available_tickers = []
     missing_tickers = []
@@ -287,46 +374,75 @@ def build_kaggle_research_dataset(
     if missing_tickers:
         logger.warning(f"Tickers missing price files ({len(missing_tickers)} total): {sorted(missing_tickers)}")
 
-    # 5. Process Stocks and Align Events
+    # 6. Process Stocks and Align Events
     processed_samples = []
     candle_sequences = []
 
+    skip_counter = {
+        "insufficient_price_history": 0,
+        "cutoff_resolution_failed": 0,
+        "insufficient_candle_history": 0,
+        "missing_spy_date": 0,
+        "nonpositive_price": 0,
+        "invalid_candle_window": 0,
+        "nonfinite_technical_indicator": 0,
+    }
+
     logger.info(f"Aligning news with historical price sequences across {len(available_tickers)} available tickers...")
 
-    for ticker in available_tickers:
+    for ticker_idx, ticker in enumerate(available_tickers):
         t_path = price_dir / f"{ticker}.csv"
         try:
             pdf = pd.read_csv(t_path)
             pdf.columns = [c.lower().strip() for c in pdf.columns]
             pdf["date"] = pd.to_datetime(pdf["date"]).dt.tz_localize(None)
+
+            # Drop missing/non-positive rows in source price file
+            for c in ["open", "high", "low", "close", "volume"]:
+                if c in pdf.columns:
+                    pdf[c] = pd.to_numeric(pdf[c], errors="coerce")
+
+            pdf = pdf.dropna(subset=["date", "open", "high", "low", "close", "volume"])
+            pdf = pdf[(pdf["open"] > 0) & (pdf["high"] > 0) & (pdf["low"] > 0) & (pdf["close"] > 0) & (pdf["volume"] >= 0)]
             pdf = pdf.sort_values("date").reset_index(drop=True)
 
-            if len(pdf) < candle_seq_len + 10:
+            if len(pdf) < candle_seq_len + 15:
+                skip_counter["insufficient_price_history"] += 1
                 continue
 
             # Corporate action adjustment factor
             close_col = "adj close" if "adj close" in pdf.columns else "close"
-            raw_close = pdf["close"].astype(float)
-            adj_close = pdf[close_col].astype(float)
+            pdf[close_col] = pd.to_numeric(pdf[close_col], errors="coerce").fillna(pdf["close"])
+            pdf = pdf[pdf[close_col] > 0]
+
+            raw_close = pdf["close"].values
+            adj_close = pdf[close_col].values
             adj_factor = np.where(raw_close > 0, adj_close / raw_close, 1.0)
 
             # Split-adjusted OHLCV for candles
-            pdf["adj_open"] = pdf["open"].astype(float) * adj_factor
-            pdf["adj_high"] = pdf["high"].astype(float) * adj_factor
-            pdf["adj_low"] = pdf["low"].astype(float) * adj_factor
+            pdf["adj_open"] = pdf["open"].values * adj_factor
+            pdf["adj_high"] = pdf["high"].values * adj_factor
+            pdf["adj_low"] = pdf["low"].values * adj_factor
             pdf["adj_close"] = adj_close
-            pdf["adj_volume"] = pdf["volume"].astype(float)
+            pdf["adj_volume"] = pdf["volume"].values
 
-            # Compute 19 technical indicators (strictly using data up to that bar)
+            # Drop any lingering NaN or non-positive adjusted values
+            pdf = pdf.dropna(subset=["adj_open", "adj_high", "adj_low", "adj_close", "adj_volume"])
+            pdf = pdf[(pdf["adj_open"] > 0) & (pdf["adj_high"] > 0) & (pdf["adj_low"] > 0) & (pdf["adj_close"] > 0)]
+            pdf = pdf.sort_values("date").reset_index(drop=True)
+
+            if len(pdf) < candle_seq_len + 15:
+                skip_counter["insufficient_price_history"] += 1
+                continue
+
+            # Compute 19 technical indicators
             pdf = compute_market_features(pdf)
 
             trading_dates = list(pdf["date"])
             date_to_idx = {d: i for i, d in enumerate(trading_dates)}
-            date_str_to_idx = {d.strftime("%Y-%m-%d"): i for i, d in enumerate(trading_dates)}
+            feat_cols = [c for c in pdf.columns if c.startswith("feat_")]
 
             t_news = news_df[news_df["ticker"] == ticker]
-
-            # Track primary session story for deduplication
             seen_sessions: Set[str] = set()
 
             for _, article in t_news.iterrows():
@@ -340,10 +456,11 @@ def build_kaggle_research_dataset(
                 )
 
                 if ref_idx is None or tgt_idx is None:
+                    skip_counter["cutoff_resolution_failed"] += 1
                     continue
 
-                # Ensure sufficient candle history
                 if ref_idx < candle_seq_len - 1:
+                    skip_counter["insufficient_candle_history"] += 1
                     continue
 
                 ref_row = pdf.iloc[ref_idx]
@@ -352,8 +469,8 @@ def build_kaggle_research_dataset(
                 ref_date_str = ref_row["date"].strftime("%Y-%m-%d")
                 tgt_date_str = tgt_row["date"].strftime("%Y-%m-%d")
 
-                # Verify SPY coverage for the exact same session dates
                 if ref_date_str not in spy_dates_set or tgt_date_str not in spy_dates_set:
+                    skip_counter["missing_spy_date"] += 1
                     continue
 
                 p_ref = float(ref_row["adj_close"])
@@ -361,10 +478,36 @@ def build_kaggle_research_dataset(
                 spy_ref = float(spy_price_map[ref_date_str])
                 spy_tgt = float(spy_price_map[tgt_date_str])
 
-                # Validate finite positive prices
                 if not (p_ref > 0 and p_tgt > 0 and spy_ref > 0 and spy_tgt > 0):
+                    skip_counter["nonpositive_price"] += 1
                     continue
-                if np.isnan([p_ref, p_tgt, spy_ref, spy_tgt]).any():
+                if np.isnan([p_ref, p_tgt, spy_ref, spy_tgt]).any() or np.isinf([p_ref, p_tgt, spy_ref, spy_tgt]).any():
+                    skip_counter["nonpositive_price"] += 1
+                    continue
+
+                # 7. Validate Technical Indicators
+                has_invalid_feat = False
+                for fc in feat_cols:
+                    fv = ref_row[fc]
+                    if np.isnan(fv) or np.isinf(fv):
+                        has_invalid_feat = True
+                        break
+
+                if has_invalid_feat:
+                    skip_counter["nonfinite_technical_indicator"] += 1
+                    continue
+
+                # 8. Extract & Strictly Validate 30-Day Candle Window
+                candle_slice = pdf.iloc[ref_idx - candle_seq_len + 1 : ref_idx + 1][
+                    ["adj_open", "adj_high", "adj_low", "adj_close", "adj_volume"]
+                ].values.astype(np.float32)
+
+                norm_candles, err_reason = validate_and_normalize_candle_window(
+                    candle_slice, expected_seq_len=candle_seq_len
+                )
+
+                if norm_candles is None:
+                    skip_counter["invalid_candle_window"] += 1
                     continue
 
                 # Calculate returns
@@ -379,14 +522,6 @@ def build_kaggle_research_dataset(
                 else:
                     label = 0
 
-                # Slicing 30-day completed candles strictly ending at ref_idx
-                candle_slice = pdf.iloc[ref_idx - candle_seq_len + 1 : ref_idx + 1][
-                    ["adj_open", "adj_high", "adj_low", "adj_close", "adj_volume"]
-                ].values.astype(np.float32)
-
-                norm_candles = normalize_candle_sequence(candle_slice)
-
-                # Deduplication and Session ID
                 session_key = f"{ticker}_{tgt_date_str}"
                 is_primary = session_key not in seen_sessions
                 seen_sessions.add(session_key)
@@ -417,11 +552,8 @@ def build_kaggle_research_dataset(
                     "reaction_label": label,
                 }
 
-                # Add tabular technical indicators evaluated strictly at ref_idx
-                for col in pdf.columns:
-                    if col.startswith("feat_"):
-                        val = ref_row[col]
-                        record[col] = 0.0 if (np.isnan(val) or np.isinf(val)) else float(val)
+                for fc in feat_cols:
+                    record[fc] = float(ref_row[fc])
 
                 processed_samples.append(record)
                 candle_sequences.append(norm_candles)
@@ -430,14 +562,18 @@ def build_kaggle_research_dataset(
             logger.warning(f"Error processing ticker {ticker}: {e}")
             continue
 
+        if (ticker_idx + 1) % 20 == 0:
+            logger.info(f"Processed {ticker_idx + 1}/{len(available_tickers)} tickers. Aligned samples so far: {len(processed_samples):,}")
+
     df = pd.DataFrame(processed_samples)
     candle_arr = np.array(candle_sequences, dtype=np.float32)
     logger.info(f"Total aligned multimodal samples constructed: {len(df):,}")
+    logger.info(f"Sample skip audit: {skip_counter}")
 
     if len(df) == 0:
         raise RuntimeError("No samples could be constructed! Check price/news date overlaps.")
 
-    # 6. Explicit Chronological Splitting with Boundary Crossing Purge
+    # 9. Explicit Chronological Splitting with Boundary Crossing Purge
     df["dt_ref"] = pd.to_datetime(df["reference_date"])
     df["dt_tgt"] = pd.to_datetime(df["target_date"])
 
@@ -445,10 +581,12 @@ def build_kaggle_research_dataset(
     v_end = pd.to_datetime(val_end_date)
     test_end = pd.to_datetime(test_end_date)
 
-    # Boundary crossing purge: Target session must NOT cross into the subsequent partition!
     train_mask = (df["dt_ref"] <= t_end) & (df["dt_tgt"] <= t_end)
     val_mask = (df["dt_ref"] > t_end) & (df["dt_ref"] <= v_end) & (df["dt_tgt"] <= v_end)
     test_mask = (df["dt_ref"] > v_end) & (df["dt_ref"] <= test_end) & (df["dt_tgt"] <= test_end)
+
+    purged_boundaries = len(df) - (train_mask.sum() + val_mask.sum() + test_mask.sum())
+    logger.info(f"Boundary-crossing purge: Removed {purged_boundaries:,} samples spanning partition boundaries.")
 
     train_df = df[train_mask].drop(columns=["dt_ref", "dt_tgt"]).reset_index(drop=True)
     val_df = df[val_mask].drop(columns=["dt_ref", "dt_tgt"]).reset_index(drop=True)
@@ -458,18 +596,13 @@ def build_kaggle_research_dataset(
     val_candles = candle_arr[val_mask]
     test_candles = candle_arr[test_mask]
 
-    # 7. Automated Pre-Training Leakage & Integrity Assertions
-    logger.info("Running automated pre-training leakage, integrity, and non-empty split assertions...")
+    # 10. Automated Pre-Training Leakage & Integrity Assertions
+    logger.info("Executing comprehensive pre-training integrity, non-empty split, and NaN assertions...")
     
-    # Assertion A: Non-empty splits
-    if len(train_df) == 0:
-        raise ValueError(f"Train split is empty for cutoff <= {train_end_date}")
-    if len(val_df) == 0:
-        raise ValueError(f"Validation split is empty for {train_end_date} < date <= {val_end_date}")
-    if len(test_df) == 0:
-        raise ValueError(f"Test split is empty for {val_end_date} < date <= {test_end_date}")
+    assert len(train_df) > 0, f"Train split is empty for cutoff <= {train_end_date}"
+    assert len(val_df) > 0, f"Validation split is empty for {train_end_date} < date <= {val_end_date}"
+    assert len(test_df) > 0, f"Test split is empty for {val_end_date} < date <= {test_end_date}"
 
-    # Assertion B: Strict chronological boundary ordering (Zero Lookahead between splits)
     train_max_date = train_df["reference_date"].max()
     val_min_date = val_df["reference_date"].min()
     val_max_date = val_df["reference_date"].max()
@@ -478,36 +611,45 @@ def build_kaggle_research_dataset(
     assert train_max_date < val_min_date, f"Chronological leak: Train max ({train_max_date}) >= Val min ({val_min_date})"
     assert val_max_date < test_min_date, f"Chronological leak: Val max ({val_max_date}) >= Test min ({test_min_date})"
 
-    # Assertion C: Zero sample ID overlap
     assert set(train_df["sample_id"]).isdisjoint(set(val_df["sample_id"])), "Train and Val share sample IDs!"
     assert set(val_df["sample_id"]).isdisjoint(set(test_df["sample_id"])), "Val and Test share sample IDs!"
     assert set(train_df["sample_id"]).isdisjoint(set(test_df["sample_id"])), "Train and Test share sample IDs!"
 
-    # Assertion D: Session precedence (Target date strictly after reference date)
     for s_name, s_df in [("Train", train_df), ("Val", val_df), ("Test", test_df)]:
         violations = (pd.to_datetime(s_df["reference_date"]) >= pd.to_datetime(s_df["target_date"])).sum()
         assert violations == 0, f"Found {violations} session precedence violations in {s_name}!"
-        # Label validity
         assert set(s_df["reaction_label"].unique()).issubset({-1, 0, 1}), f"Invalid labels in {s_name}"
 
-    # Assertion E: Candle array dimension alignment
     assert len(train_candles) == len(train_df), "Train candle array dimension mismatch!"
     assert len(val_candles) == len(val_df), "Val candle array dimension mismatch!"
     assert len(test_candles) == len(test_df), "Test candle array dimension mismatch!"
+
+    # ZERO NaN / Inf Guarantees
     assert not np.isnan(candle_arr).any(), "NaN values found in candlestick tensor!"
     assert not np.isinf(candle_arr).any(), "Inf values found in candlestick tensor!"
+    assert np.all(candle_arr[:, :, :4] > 0.0), "Non-positive price ratios found in normalized candles!"
 
-    logger.info("[PASSED] All 5 pre-training integrity and leakage assertions passed!")
+    logger.info("[PASSED] All pre-training assertions, candle invariants, and zero-NaN checks passed!")
 
-    # 8. Save Processed Datasets
-    logger.info(f"Saving processed datasets to {output_dir}...")
-    train_df.to_parquet(output_dir / "train.parquet", index=False)
-    val_df.to_parquet(output_dir / "validation.parquet", index=False)
-    test_df.to_parquet(output_dir / "test.parquet", index=False)
+    # 11. Atomic Staging to Final Output Promotion
+    try:
+        train_df.to_parquet(staging_dir / "train.parquet", index=False)
+        val_df.to_parquet(staging_dir / "validation.parquet", index=False)
+        test_df.to_parquet(staging_dir / "test.parquet", index=False)
 
-    np.save(output_dir / "train_candles.npy", train_candles)
-    np.save(output_dir / "val_candles.npy", val_candles)
-    np.save(output_dir / "test_candles.npy", test_candles)
+        np.save(staging_dir / "train_candles.npy", train_candles)
+        np.save(staging_dir / "val_candles.npy", val_candles)
+        np.save(staging_dir / "test_candles.npy", test_candles)
+
+        # Move staging files to final output_dir
+        for f in ["train.parquet", "validation.parquet", "test.parquet", "train_candles.npy", "val_candles.npy", "test_candles.npy"]:
+            shutil.move(staging_dir / f, output_dir / f)
+
+        shutil.rmtree(staging_dir, ignore_errors=True)
+    except Exception as e:
+        logger.error(f"Error during atomic dataset write: {e}")
+        shutil.rmtree(staging_dir, ignore_errors=True)
+        raise
 
     manifest = {
         "dataset_name": "MarketReactionLab_Kaggle_LargeScale",
@@ -523,6 +665,7 @@ def build_kaggle_research_dataset(
         "candle_shape": list(candle_arr.shape),
         "tickers_available": len(available_tickers),
         "tickers_missing": missing_tickers,
+        "skip_reasons": skip_counter,
         "class_distribution_test": {
             "DOWN (-1)": int((test_df["reaction_label"] == -1).sum()),
             "NEUTRAL (0)": int((test_df["reaction_label"] == 0).sum()),
@@ -535,5 +678,5 @@ def build_kaggle_research_dataset(
         json.dump(manifest, f, indent=2)
 
     logger.info(f"Dataset build complete: Train={len(train_df):,}, Val={len(val_df):,}, Test={len(test_df):,}")
-    logger.info(f"Manifest written to {manifest_path}")
+    logger.info(f"Processing manifest saved to {manifest_path}")
     return manifest

@@ -258,14 +258,21 @@ cells = [
             "print(f\"Holdout Status:     Non-Pristine (Audited Chronological Benchmark, Coverage ends 2020-06-11)\")\n",
             "print(f\"Train Candles Shape:{train_candles.shape}\")\n",
             "print(f\"Test Candles Shape: {test_candles.shape}\")\n",
+            "print(f\"\\nSample Skip Audit:\")\n",
+            "for reason, count in manifest.get('skip_reasons', {}).items():\n",
+            "    print(f\"  - {reason}: {count:,}\")\n",
+            "if manifest.get('tickers_missing'):\n",
+            "    print(f\"\\nMissing Price Files ({len(manifest['tickers_missing'])} tickers): {manifest['tickers_missing']}\")\n",
             "\n",
             "# Integrity Assertions\n",
             "assert len(train_df) > 0 and len(val_df) > 0 and len(test_df) > 0, \"Split cannot be empty!\"\n",
-            "assert train_df['event_date'].max() < val_df['event_date'].min(), \"Train/Val date overlap!\"\n",
-            "assert val_df['event_date'].max() < test_df['event_date'].min(), \"Val/Test date overlap!\"\n",
+            "assert train_df['reference_date'].max() < val_df['reference_date'].min(), \"Train/Val date overlap!\"\n",
+            "assert val_df['reference_date'].max() < test_df['reference_date'].min(), \"Val/Test date overlap!\"\n",
             "assert len(train_candles) == len(train_df), \"Candle count mismatch in train!\"\n",
             "assert len(test_candles) == len(test_df), \"Candle count mismatch in test!\"\n",
-            "print(\"\\n[PASSED] All chronological boundary, join, and candle assertions verified successfully!\")"
+            "assert not np.isnan(train_candles).any() and not np.isnan(test_candles).any(), \"NaNs in candles!\"\n",
+            "print(\"\\n[PASSED] All chronological boundary, join, candle invariants, and zero-NaN assertions verified successfully!\")"
+
         ]
     },
     {
