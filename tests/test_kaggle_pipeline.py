@@ -113,3 +113,48 @@ def test_kaggle_dataset_and_collate():
     assert collated["label"].shape == (2,)
     assert collated["indicators"].shape == (2, 2)
     assert collated["candles"].shape == (2, 30, 5)
+
+
+def test_resolve_market_cutoff_sessions():
+    """Verify UTC to America/New_York market hours alignment rules."""
+    from datetime import datetime
+    import zoneinfo
+    from src.data.kaggle_dataset_builder import resolve_market_cutoff_sessions
+
+    trading_dates = [
+        pd.Timestamp("2020-01-02"),
+        pd.Timestamp("2020-01-03"),
+        pd.Timestamp("2020-01-06"),  # Monday
+        pd.Timestamp("2020-01-07"),
+    ]
+    date_to_idx = {d: i for i, d in enumerate(trading_dates)}
+    utc = zoneinfo.ZoneInfo("UTC")
+
+    # 1. Pre-market: 2020-01-03 12:00:00 UTC = 07:00:00 NY (Friday morning before open)
+    pub_utc = datetime(2020, 1, 3, 12, 0, 0, tzinfo=utc)
+    ref_idx, tgt_idx, cutoff, cat = resolve_market_cutoff_sessions(pub_utc, trading_dates, date_to_idx)
+    assert ref_idx == 0  # 2020-01-02 Close (prior day)
+    assert tgt_idx == 1  # 2020-01-03 Close (today)
+    assert cat == "pre_market"
+
+    # 2. Intraday: 2020-01-03 16:00:00 UTC = 11:00:00 NY (Friday midday)
+    pub_utc = datetime(2020, 1, 3, 16, 0, 0, tzinfo=utc)
+    ref_idx, tgt_idx, cutoff, cat = resolve_market_cutoff_sessions(pub_utc, trading_dates, date_to_idx)
+    assert ref_idx == 1  # 2020-01-03 Close (today)
+    assert tgt_idx == 2  # 2020-01-06 Close (Monday - next session)
+    assert cat == "intraday"
+
+    # 3. Post-market: 2020-01-03 22:00:00 UTC = 17:00:00 NY (Friday evening after close)
+    pub_utc = datetime(2020, 1, 3, 22, 0, 0, tzinfo=utc)
+    ref_idx, tgt_idx, cutoff, cat = resolve_market_cutoff_sessions(pub_utc, trading_dates, date_to_idx)
+    assert ref_idx == 1  # 2020-01-03 Close
+    assert tgt_idx == 2  # 2020-01-06 Close
+    assert cat == "post_market"
+
+    # 4. Ambiguous Midnight: 2020-01-03 00:00:00 UTC
+    pub_utc = datetime(2020, 1, 3, 0, 0, 0, tzinfo=utc)
+    ref_idx, tgt_idx, cutoff, cat = resolve_market_cutoff_sessions(pub_utc, trading_dates, date_to_idx)
+    assert ref_idx is not None
+    assert tgt_idx == ref_idx + 1
+    assert cat == "ambiguous_midnight"
+
