@@ -1,90 +1,69 @@
-# MarketReactionLab: Quantitative Research Methodology & Leakage Prevention Protocol
+# Research methodology and evaluation boundaries
 
-## 1. Mathematical Formulation
+**Status: exploratory working research; not peer-reviewed, not a verified point-in-time trading strategy.** The [archived Phase 1 methodology](docs/legacy/PHASE1_METHODOLOGY_2026.md) describes a historically distinct prototype and should not be interpreted as the V2–V20 experiment protocol.
 
-Let $s \in \mathcal{S}$ denote a stock symbol and $D$ denote the publication calendar date of a news event in America/New_York local time.
+## 1. Response variable
 
-### Prediction Cutoff
-To prevent lookahead bias originating from imprecise publication minutes (such as midnight placeholders `00:00:00 UTC`), we define the historical prediction cutoff:
-$$T_{\text{cutoff}}(D) = \text{Start of Calendar Date } (D + 1) \text{ at 00:00:00 EST/EDT}$$
+For stock `s` and consecutive exchange trading sessions `t` and `t+1`, the saved target is next-session close-to-close **SPY-relative excess return**:
 
-### NYSE Session Alignment
-Using the New York Stock Exchange calendar ($\mathcal{T}_{\text{NYSE}}$):
-1. **Reference Session ($t_{\text{ref}}$):**
-   $$t_{\text{ref}}(D) = \max \{ t \in \mathcal{T}_{\text{NYSE}} \mid t \le D \}$$
-   If $D$ is a weekend or holiday, $t_{\text{ref}}$ maps to the preceding completed Friday trading session.
-2. **Target Session ($t_{\text{tgt}}$):**
-   $$t_{\text{tgt}}(D) = \min \{ t \in \mathcal{T}_{\text{NYSE}} \mid t > t_{\text{ref}}(D) \}$$
-   By mathematical construction: $t_{\text{tgt}} > t_{\text{ref}}$ for all samples without exception.
+```text
+r_stock(t→t+1) = C_stock(t+1)/C_stock(t) - 1
+r_SPY(t→t+1)   = C_SPY(t+1)/C_SPY(t) - 1
+e(s,t)         = r_stock(t→t+1) - r_SPY(t→t+1)
 
-### Return and Label Definitions
-Let $C_s(t)$ and $C_{\text{SPY}}(t)$ be the official closing prices of stock $s$ and the benchmark SPY at session $t$:
-$$R_{\text{raw}}(s, D) = \frac{C_s(t_{\text{tgt}})}{C_s(t_{\text{ref}})} - 1.0$$
-$$R_{\text{SPY}}(D) = \frac{C_{\text{SPY}}(t_{\text{tgt}})}{C_{\text{SPY}}(t_{\text{ref}})} - 1.0$$
-$$R_{\text{adj}}(s, D) = R_{\text{raw}}(s, D) - R_{\text{SPY}}(D)$$
+negative: e < −0.005 | neutral: −0.005 ≤ e ≤ +0.005 | positive: e > +0.005
+```
 
-Given a symmetric threshold $\theta = 0.005$ (50 basis points):
-$$y(s, D) = \begin{cases} 
-2 \ (\text{UP}) & \text{if } R_{\text{adj}} > \theta \\
-1 \ (\text{NEUTRAL}) & \text{if } -\theta \le R_{\text{adj}} \le \theta \\
-0 \ (\text{DOWN}) & \text{if } R_{\text{adj}} < -\theta
-\end{cases}$$
+This is a **classification definition, not a tradable return**. An investor who sees the complete close(t) candle or after-close headlines cannot usually execute at the already-elapsed close(t), so close-to-close labels do **not** establish a feasible same-price trading strategy. Proper trading assessment would require a decision and order time, the next executable price, costs, and appropriately redefined targets.
 
----
+## 2. Prediction-time definitions (do not merge these protocols)
 
-## 2. Leakage Prevention Protocol & Invariants
+### Phase 1 news-alignment prototype (25-stock, 19-feature archive)
 
-| Leakage Risk | Protocol Enforcement | Invariant Audit |
-|---|---|---|
-| **Future Candle in Features** | Technical indicators are computed strictly using price series $\{ C(t) \mid t \le t_{\text{ref}} \}$. | Verified by automated unit test `test_zero_future_feature_leakage`. |
-| **Intraday Announcement Bleed** | All news on date $D$ is quarantined until date $D+1$. Target return is evaluated from close($t_{\text{ref}}$) to close($t_{\text{tgt}}$). | Ensures news availability precedes trading session outcome. |
-| **Split Boundary Bleed** | Purge window: any event in split $k$ whose target session spans into split $k+1$ is purged. | Invariant: $\max(train) < \min(val)$ and $\max(val) < \min(test)$. |
-| **Sample Disjointness** | Deterministic sample identifiers enforce that no sample appears in multiple splits. | `train_val_overlap == 0` and `val_test_overlap == 0`. |
-| **Tool Information Leakage** | All research agent tools require `as_of` timestamp. Future prices and uncompleted event outcomes are masked. | Enforced in `AsOfReplayClient` with regression test suite. |
+The Phase 1 source `src/data/time_alignment.py` uses a cutoff of **00:00 New York time on calendar day D+1**, after a nominal date-D news record, and labels the **close(reference session) → close(next session)** return. Under its assumption, news genuinely published after close(D) but before midnight(D+1) would be available at cutoff; **however**, the target starts at close(D), which predates the decision. The temporal ordering of news availability and target start must be corrected for any executable-trading claim.
 
----
+### V2–V18 historical news track (16 indicators)
 
-## 3. Class Balance and Distribution Strategy
+The archived processed historical news rows were all labelled `untrusted_date_only` during the V18 audit (165,983 training and 41,670 2018 validation **article rows**). The underlying `timestamp_confidence=date_placeholder` field in **Phase 1** is related in spirit but comes from a **different schema**. Do not assert these literal field values exist in every version. A date-level cutoff check does not prove when an article was really made public, nor guard against timezone conversion error, content later revised, ambiguous tickers, or news dated the following trading session.
 
-With threshold $\theta = 0.005$:
-- **DOWN:** ~33.5%
-- **NEUTRAL:** ~31.8%
-- **UP:** ~34.6%
+For genuine point-in-time tests, acquire original timestamp and timezone provenance, define cutoff and order execution precisely, and construct features and labels that are non-overlapping in the intended economic interpretation.
 
-This produces a balanced 3-class distribution across all chronological partitions, avoiding degenerate trivial majority-class classifiers while preserving continuous $R_{\text{adj}}$ for regression models.
+### V9–V13 and V20 modern price-only track
 
----
+The modern cohort uses reference-session price indicators. Historical returns are close(t) to close(t+1) relative to SPY; the recorded classification scores describe **retrospective supervised learning**, not orders executable at close(t). V13 adds **cross-sectional medians** of reference-day indicators across the selected observed stock universe; those medians are not observed SPY values and require the same universe panel in production.
 
-## 4. Experimental Research Model Configurations
+## 3. Dataset-specific experiment windows and inputs
 
-The research project compares seven distinct quantitative and AI configurations:
+| Cohort | Training / selection | Reported evaluation | Feature definitions |
+|---|---|---|---|
+| Phase 1 | 2010–2017 train | 2018 validation; 2019–2020 prototype test | 25 selected stocks, **19** features |
+| V2 historical news | 2009–2017 sessions | 2018 (18,178 unique stock sessions) | **16** price indicators and timestamp-uncertain headlines |
+| V16 FinBERT+price | Up to 42,000 sampled **pre-2017** sessions; 2017 checkpoint selection | Same previously examined 2018 cohort | 16 indicators plus bounded headline text; **not training-matched to V2** |
+| V9 modern price model | 2020–2023 | 2024 (33,885 sessions), later 2025–Oct 2026 (60,480) | 16 indicators |
+| V13 modern market-context model | **Replay source** selects on 2023 after fitting 2020–2022, then refits selected LightGBM on **2020–2023** | Reused 2024; **V20** second-look 2025–Oct 2026 | 16 indicators +14 context/relative features |
+| V14 news pilot | 2020 matched news: 4,770 sessions before pilot cutoff | 1,854 sessions across 34 dates | News TF-IDF and price |
+| V19 LLM pilot | No ordinary model fitting in 20-case pilot | 20 cases from 2020 | Groq-hosted `openai/gpt-oss-20b`; tool returned the **same saved evidence** as direct prompt |
 
-1. **Model 1: Price-Only Machine Learning Baseline**
-   - Inputs: 19 backward-looking technical, momentum, and benchmark indicators.
-   - Architectures: Histogram Gradient Boosted Trees, Random Forest, L2-Regularized Logistic Regression, and PyTorch 3-layer MLP.
-   - Purpose: Establishes the baseline predictive power of pure candlestick price action without textual information.
+**Important checkpoint uncertainty:** The V13 replay script documents final training through 2023, but its archived filename `v13_model_pre2025.joblib` alone is **not proof** of fitted dates. Checkpoint-level metadata/hash and full rerun remain pending. V13–V9 changes model architecture/hyperparameters **and** features; it is **not** a clean context-feature ablation. V12 is not automatically a matched control because its settings differed.
 
-2. **Model 2: News-Only FinBERT Model**
-   - Inputs: Financial news headlines tokenized and fed into pre-trained `ProsusAI/finbert`.
-   - Purpose: Isolates the direct information value of financial sentiment for next-session directional predictability.
+## 4. Evaluation and model-selection caution
 
-3. **Model 3: News + Candlestick Multimodal Fusion (Frozen FinBERT)**
-   - Inputs: Concatenated news headlines (768-dim `[CLS]` embedding from frozen FinBERT) + 19 numerical price features.
-   - Architecture: Late-fusion neural network with batch normalization, layer normalization, dropout, and a dense classification head.
-   - Purpose: Tests whether conditioning linguistic representations on historical price action outperforms unimodal baselines.
+The 2018 historical news and 2024 modern-price validation cohorts were examined repeatedly during model development. V10 already opened the modern 2025–2026 period before V20. **V20 is a frozen-model, post-hoc second look, not an independent holdout.**
 
-4. **Model 4: Our Fine-Tuned FinBERT Fusion Model**
-   - Architecture: Top transformer layers (layers 9–11 + pooler) fine-tuned end-to-end with the numerical feature fusion head.
-   - Purpose: Adapts general financial language representations directly to stock return predictability.
+The paper reports paired **date-resampling confidence intervals** and a 10,000-replicate **week-block** interval for the V20 macro-F1 difference. These quantify uncertainty **conditional on the selected models and stored predictions** and do not correct adaptive model selection, repeated validation access, cross-year regime changes, or survivorship bias.
 
-5. **Model 5: LLM (OpenAI API / Prompt Agent) without External Research Tools**
-   - Inputs: Ticker, event date, and news headlines only. Zero external context or tool access.
-   - Purpose: Evaluates pure generative reasoning capabilities in isolation.
+V20 accuracy and Macro-F1 were recomputed from the available prediction CSV. V18 verified structural returns/labels **only for its historical 2009–2018 news files**, not the distinct V14 dataset or modern Yahoo-price source. Full modern feature timing, raw-price return reconstruction, execution-ready targets, and adjusted-price/survivorship audits remain incomplete.
 
-6. **Model 6: LLM with Historical Research Tools**
-   - Inputs: LLM equipped with read-only historical tools (`get_price_history`, `get_market_context`, `find_similar_events`).
-   - Purpose: Benchmarks the value of simulated historical research without future leakage.
+## 5. Score interpretation and needed controls
 
-7. **Model 7: Fine-Tuned Model Combined with Tool-Enabled Research Agent**
-   - Architecture: Hybrid quantitative-qualitative decision engine. High-conviction multimodal probabilities are accepted directly; high-uncertainty samples are arbitrated by the tool-enabled historical research agent.
-   - Purpose: Achieves optimal risk-adjusted returns and Sharpe ratio by combining statistical precision with agentic qualitative depth.
+- Macro-F1 gives equal weight to three threshold-defined labels. It does **not** measure economic alpha.
+- Many modern samples are non-neutral; the trivial **always-non-neutral** detector achieves binary F1 ≈ **0.8395** on the V20 cohort, which exceeds the reported V9/V13 binary detection F1. Big-move F1 must be reported with this baseline, not as evidence of novel skill.
+- V20 conditional positive/negative sign accuracy is near 50%. This does **not** establish directional edge. A rigorous sign test should compare a constant-sign baseline over the **same truly non-neutral cohort**.
+- V13 predicts fewer neutrals. A **neutral-probability scaling sensitivity sweep on 2025–2026 is post-hoc** and cannot be described as independent testing. Future threshold selection must occur **only** in an earlier development period, with a frozen rule evaluated later.
+- Required preprint upgrades: matched LightGBM feature ablation; volatility-only rule; real SPY feature control; label permutation and 1-day feature shifts; proper chronological walk-forward; verified article timestamps; 2018 price-only neural control; archived trial ledger with multiplicity assessment.
+
+## 6. Reproducibility, source licensing and authorship
+
+See [research notebook guide](docs/research/NOTEBOOK_GUIDE.md) for Kaggle dependency and artifact requirements. The historical FNSPID source is identified as **CC BY-NC 4.0** in the Phase 1 dataset card, subject to verifying the exact files and upstream rights. FinBERT model weights have separate **CC BY-NC-SA 4.0** license implications; do not redistribute weights or third-party raw headlines by assuming that making code public allows it. Repository code licensing is **not yet selected** by the project owner.
+
+The research manuscript is a **working preprint**, not an IEEE-reviewed publication. Author and contributor disclosures, including any required AI-assistance statement, must be finalized by the author before deposit.

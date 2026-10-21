@@ -1,84 +1,34 @@
-﻿# Dataset Card: MarketReactionLab Phase 1 Dataset
+# MarketReactionLab — Dataset cards by experiment cohort
 
-## 1. Dataset Description
+**Not one interchangeable dataset.** The [original Phase 1 dataset card](docs/legacy/PHASE1_DATASET_CARD_2026.md) documents an earlier 25-stock, 19-feature prototype (12,871 samples). Later studies use different source files, label schemas and ticker universes. Nothing in this card certifies future-information-free, survivorship-free, or trade-executable data.
 
-The **MarketReactionLab Phase 1 Dataset** is a production-quality, leakage-aware multimodal financial dataset engineered to evaluate whether financial news combined with historical candlesticks can predict next-session market-adjusted stock reactions.
+## Cohort descriptions
 
-- **Primary Source:** [FNSPID: Financial News and Stock Price Integration Dataset](https://huggingface.co/datasets/Zihan1004/FNSPID) (Dong et al., arXiv:2402.06698, KDD 2024).
-- **Benchmark Source:** Historical SPY ETF records from the FNSPID central archive.
-- **License:** Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC-4.0).
-- **Target Task:** 3-class classification (`DOWN`=0, `NEUTRAL`=1, `UP`=2) of next-session market-adjusted return ($R_{\text{adj}} = R_{\text{stock}} - R_{\text{SPY}}$) with symmetric $\pm 0.5\%$ boundary, along with continuous raw and market-adjusted returns for regression benchmarking.
+| Research track | Observation unit | Reported counts | Period & input |
+|---|---|---|---|
+| Phase 1 FNSPID prototype | Prototype event sample | 9,110 train / 1,267 validation / 2,494 test | 25 stocks, SPY, 19 indicators |
+| V2–V18 historical news | **Article rows and unique ticker-session observations**, counted separately | 165,983 / 41,670 article rows; 84,584 / 18,178 unique sessions | Train to 2017 / validation 2018; FNSPID news and historical prices; 16 indicators |
+| V9/V13 modern prices | Stock session | 135,675 training / 33,885 2024 validation / 60,480 2025–Oct 2026 second look; total 230,040 | Yahoo Finance-based historical prices; selected surviving tickers, 16 or 30 engineered indicators |
+| V14 matched news | News-bearing stock sessions | 4,770 training / 1,854 eval across 34 dates | Another 2020 headline dataset (Kaggle: `miguelaenlle/massive-stock-news-analysis-db-for-nlpbacktests`); distinct from V18 audit |
+| V19 tool-agent pilot | Saved 2020 case | 20 cases | Subsample of V14, Groq-hosted `openai/gpt-oss-20b` |
 
----
+The modern 2025–2026 observations contain **60,480 samples on 448 trading dates**; the research audit used a saved prediction CSV for statistical recomputation. That is not the same as independently recreating vendor prices or retraining model parameters.
 
-## 2. Dataset Structure & Schema
+## Labels and data schema
 
-The dataset is partitioned into three chronological Parquet files:
-- `data/processed/train.parquet` (9,110 samples)
-- `data/processed/validation.parquet` (1,267 samples)
-- `data/processed/test.parquet` (2,494 samples)
+The research response is the next-session stock **close-to-close** return minus same-period SPY return, classified at fixed **±0.5%** boundaries. The Phase 1 data card uses `class_label={0,1,2}` and `timestamp_confidence={date_placeholder,verified_timestamp}`. Later research files may use `reaction_label={-1,0,1}` and `timestamp_trust=untrusted_date_only`. Do not treat fields and codes from different cohorts as identical.
 
-### Data Fields
+## Timestamp / price-source restrictions
 
-| Field Name | Type | Description |
-|---|---|---|
-| `sample_id` | String | Unique sample identifier (e.g., `SMP_AAPL_2018-05-15_2018-05-15`) |
-| `ticker` | String | Ticker symbol of the company (e.g., `AAPL`, `ADBE`, `AIG`) |
-| `event_date` | String | Calendar date $D$ of the news event in America/New_York (YYYY-MM-DD) |
-| `prediction_cutoff` | String | Point-in-time timestamp (00:00:00 America/New_York on $D+1$) |
-| `reference_session` | String | Last completed NYSE session on or before $D$ |
-| `target_session` | String | Next completed NYSE session strictly after `reference_session` |
-| `news_titles` | List[String] | List of distinct headlines associated with ticker on date $D$ |
-| `news_text` | String | Concatenated string of headlines separated by `[SEP]` |
-| `news_ids` | List[String] | Deterministic SHA256 news identifiers |
-| `news_count` | Int64 | Number of grouped headlines (capped at 5) |
-| `news_source_metadata` | String | Publishers associated with the headlines |
-| `topic_labels` | List[String] | Rule-based event taxonomy categories (e.g., Earnings, Guidance) |
-| `timestamp_confidence` | String | `verified_timestamp` or `date_placeholder` |
-| `numerical_features` | List[Float64] | 19 leakage-free derived technical and market features |
-| `reference_close` | Float64 | Closing price of the stock at `reference_session` |
-| `target_close` | Float64 | Closing price of the stock at `target_session` |
-| `spy_reference_close` | Float64 | Closing price of SPY benchmark at `reference_session` |
-| `spy_target_close` | Float64 | Closing price of SPY benchmark at `target_session` |
-| `raw_return` | Float64 | Next-session raw return: $(C_{\text{target}} / C_{\text{ref}}) - 1$ |
-| `spy_return` | Float64 | Benchmark return over identical trading sessions |
-| `market_adjusted_return` | Float64 | Market-adjusted excess return: `raw_return - spy_return` |
-| `class_label` | Int64 | Target class: 0 (`DOWN`), 1 (`NEUTRAL`), 2 (`UP`) |
-| `class_name` | String | Text label name |
-| `data_quality_flags` | String | Quality indicators (`aligned_valid`) |
-| `split` | String | Chronological partition (`train`, `validation`, `test`) |
+- V18 found **all 207,653 audited 2009–2018 article records** marked `untrusted_date_only`. That does not establish that 100% of a separately sourced 2020 dataset has the same timing issue; V14's timing was not independently audited.
+- A Phase 1 cutoff at **00:00 local time on date D+1** is an assumption about the previous date's article availability, not proof of publisher timestamps. Its price target nevertheless starts at close(D); news arriving afterward cannot be executed at close(D).
+- The modern stock universe appears to be selected among surviving liquid tickers; historical membership and delistings are incompletely assessed. The 2025–2026 period was previously opened for development evaluation.
+- Upstream adjustments, dividends, splits and data vendor revision policies must be audited before any real-world trading interpretation.
 
----
+## Source rights and repository artifacts
 
-## 3. Numerical Feature Definitions
+The [FNSPID dataset record](https://huggingface.co/datasets/Zihan1004/FNSPID) was labelled **CC BY-NC 4.0** in the Phase 1 configuration and card; review the actual redistributed file licenses and third-party rights separately. A public code repository license (still **undecided**) cannot authorize redistribution of raw third-party headlines/price CSVs. FinBERT pretrained weights have a separate noncommercial/share-alike license.
 
-The `numerical_features` array contains 19 backward-looking technical indicators computed strictly at or prior to the reference session:
+Experiment reports, saved predictions and exact model checkpoints are listed in research provenance documentation. Some Kaggle datasets may be private. **Do not claim a fresh-clone, end-to-end reproduction until the dependencies and archived inputs have been executed successfully.**
 
-1. `ret_1d`: 1-session return ($C_t / C_{t-1} - 1$)
-2. `ret_3d`: 3-session return ($C_t / C_{t-3} - 1$)
-3. `ret_5d`: 5-session return ($C_t / C_{t-5} - 1$)
-4. `ret_10d`: 10-session return ($C_t / C_{t-10} - 1$)
-5. `ret_20d`: 20-session return ($C_t / C_{t-20} - 1$)
-6. `rolling_vol_20d`: 20-session sample standard deviation of daily returns
-7. `relative_volume`: $V_t$ divided by 20-session average volume
-8. `rolling_hl_range_20d`: 20-session mean of normalized high-low span: $(H - L) / C$
-9. `candle_body_ratio`: Absolute candle body ratio: $|C_t - O_t| / (H_t - L_t)$
-10. `upper_wick_ratio`: Upper wick proportion: $(H_t - \max(O_t, C_t)) / (H_t - L_t)$
-11. `lower_wick_ratio`: Lower wick proportion: $(\min(O_t, C_t) - L_t) / (H_t - L_t)$
-12. `rsi_14`: 14-period Wilder Relative Strength Index
-13. `macd`: Standard MACD line (EMA 12 - EMA 26)
-14. `macd_signal`: MACD signal line (EMA 9 of MACD line)
-15. `macd_hist`: MACD histogram (MACD line - Signal line)
-16. `rel_perf_spy_20d`: Stock 20-day return minus SPY 20-day return
-17. `spy_ret_5d`: SPY 5-session return
-18. `spy_ret_20d`: SPY 20-session return
-19. `spy_vol_20d`: SPY 20-session rolling volatility
-
----
-
-## 4. Known Limitations & Caveats
-
-1. **Survivorship Bias:** Primary symbols represent liquid, surviving large-cap equities (S&P 500 constituents). Delisted micro-caps are not represented.
-2. **Date-Level Midnight Timestamps:** A substantial proportion of news records in FNSPID contain `00:00:00 UTC` date placeholders. To avoid intraday lookahead leakage, all news with date $D$ is treated as available only at the beginning of calendar date $D+1$.
-3. **Headline Focus:** News text primarily consists of news headlines and publisher teasers, as full article bodies are sparse in aggregated external news tables.
-4. **Market-Adjusted Returns:** Target labels measure next-session excess return over the SPY ETF; they do not represent execution guarantees or alpha trading signals after fees.
+See [research methodology](METHODOLOGY.md) and [Kaggle research notebook guide](docs/research/NOTEBOOK_GUIDE.md).
